@@ -1,0 +1,58 @@
+<?xml version="1.0"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools"
+    package="org.qtproject.example.appLanFileTransfer"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <!-- 常规权限 -->
+    <uses-permission android:name="android.permission.INTERNET"  />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"  />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- 存储权限：注意 MANAGE_EXTERNAL_STORAGE 是特殊权限，不会在普通权限页显示 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" 
+                     tools:ignore="ScopedStorage" />
+    <!-- 针对 Android 13+ 的附近设备发现 -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" 
+                 android:usesPermissionFlags="neverForLocation" />
+    <!-- 某些手机需要定位权限辅助扫描 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <application
+        android:name="org.qtproject.qt.android.bindings.QtApplication"
+        android:hardwareAccelerated="true"
+        android:label="飞传"
+        android:requestLegacyExternalStorage="true"
+        android:allowBackup="true"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name="org.qtproject.qt.android.bindings.QtActivity"
+            android:configChanges="orientation|uiMode|screenLayout|screenSize|smallestScreenSize|layoutDirection|locale|fontScale|keyboard|keyboardHidden|navigation|mcc|mnc|density"
+            android:launchMode="singleTop"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="appLanFileTransfer" />
+        </activity>
+
+        <!-- 如果没有 res/xml/qtprovider_paths.xml，请把下面这段 provider 删掉，否则会编译失败 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.qtprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/qtprovider_paths"/>
+        </provider>
+    </application>
+</manifest>
