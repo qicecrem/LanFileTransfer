@@ -1,427 +1,1165 @@
 #include "transfermanager.h"
-#include <QFileInfo>
-#include <QStandardPaths>
-#include <QDir>
-#include <QDataStream>
-#include <QDesktopServices>
-#include <QDateTime>
 
+#include <QCryptographicHash>
+#include <QDataStream>
+#include <QDateTime>
+#include <QDesktopServices>
+#include <QDir>
+#include <QFileInfo>
+#include <QFutureWatcher>
+#include <QHostInfo>
+#include <QPointer>
+#include <QSettings>
+#include <QStandardPaths>
+#include <QTimer>
+#include <QUuid>
+#include <QtConcurrent/QtConcurrentRun>
+#include <utility>
 
 #ifdef Q_OS_ANDROID
 #include <QJniObject>
-
-#include <QCoreApplication>
-
-// 通过 Android 底层数据库查询 content:// 的真实文件名（含后缀）
-QString getAndroidContentName(const QString &uriString) {
-    QJniObject uri = QJniObject::callStaticMethod<QJniObject>(
-        "android/net/Uri", "parse", "(Ljava/lang/String;)Landroid/net/Uri;",
-        QJniObject::fromString(uriString).object());
-
-    QJniObject context = QNativeInterface::QAndroidApplication::context();
-    if (!context.isValid()) return "";
-
-    QJniObject contentResolver = context.callMethod<QJniObject>(
-        "getContentResolver", "()Landroid/content/ContentResolver;");
-    if (!contentResolver.isValid()) return "";
-
-    // 相当于 Java: Cursor cursor = contentResolver.query(uri, null, null, null, null);
-    QJniObject cursor = contentResolver.callMethod<QJniObject>(
-        "query", "(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",
-        uri.object(), nullptr, nullptr, nullptr, nullptr);
-
-    QString fileName;
-    if (cursor.isValid()) {
-        if (cursor.callMethod<jboolean>("moveToFirst")) {
-            // 查询 OpenableColumns.DISPLAY_NAME 字段
-            QJniObject columnName = QJniObject::fromString("_display_name");
-            jint columnIndex = cursor.callMethod<jint>("getColumnIndex", "(Ljava/lang/String;)I", columnName.object());
-
-            if (columnIndex != -1) {
-                QJniObject nameObj = cursor.callMethod<QJniObject>("getString", "(I)Ljava/lang/String;", columnIndex);
-                if (nameObj.isValid()) {
-                    fileName = nameObj.toString();
-                }
-            }
-        }
-        cursor.callMethod<void>("close");
-    }
-    return fileName;
-}
+#include <QtCore/qcoreapplication_platform.h>
 #endif
 
-TransferManager::TransferManager(QObject *parent) : QObject{parent}
+namespace {
+constexpr quint32 MaxPacketSize = 4 * 1024 * 1024;
+constexpr qsizetype MaxDataChunkSize = 512 * 1024;
+constexpr qsizetype MaxTextLength = 64 * 1024;
+constexpr qint64 SessionTimeoutMs = 45000;
+constexpr int MaxReconnectAttempts = 5;
+
+bool isValidPeerId(const QString &peerId)
 {
+    return !peerId.isEmpty() && peerId.size() <= 128
+        && !peerId.contains(QLatin1Char('/')) && !peerId.contains(QLatin1Char('\\'));
+}
+
+struct DigestResult {
+    QByteArray hash;
+    qint64 size = -1;
+    QString error;
+};
+
+DigestResult calculateDigest(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return {{}, -1, file.errorString()};
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    qint64 bytesRead = 0;
+    while (true) {
+        const QByteArray chunk = file.read(1024 * 1024);
+        if (chunk.isEmpty() && file.error() != QFileDevice::NoError)
+            return {{}, -1, file.errorString()};
+        if (chunk.isEmpty()) break;
+        hash.addData(chunk);
+        bytesRead += chunk.size();
+    }
+    // Android content:// providers frequently report QFile::size() as zero.
+    // Counting the bytes read works for both local files and document URIs.
+    return {hash.result(), bytesRead, {}};
+}
+
 #ifdef Q_OS_ANDROID
-    // 强制指定 Android 的公有下载目录
-    m_saveDirectory = "/storage/emulated/0/Download";
+bool persistAndroidDirectory(const QString &uri)
+{
+    const QJniObject context = QNativeInterface::QAndroidApplication::context();
+    const QJniObject value = QJniObject::fromString(uri);
+    return context.isValid() && QJniObject::callStaticMethod<jboolean>(
+        "org/landrop/app/StorageBridge", "persistDirectory",
+        "(Landroid/content/Context;Ljava/lang/String;)Z", context.object(), value.object());
+}
+
+bool copyToAndroidDirectory(const QString &treeUri, const QString &sourcePath, const QString &fileName)
+{
+    const QJniObject context = QNativeInterface::QAndroidApplication::context();
+    const QJniObject directory = QJniObject::fromString(treeUri);
+    const QJniObject source = QJniObject::fromString(sourcePath);
+    const QJniObject name = QJniObject::fromString(fileName);
+    return context.isValid() && QJniObject::callStaticMethod<jboolean>(
+        "org/landrop/app/StorageBridge", "copyToDirectory",
+        "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
+        context.object(), directory.object(), source.object(), name.object());
+}
+#endif
+}
+
+TransferManager::TransferManager(QObject *parent) : QObject(parent)
+{
+    connect(this, &TransferManager::taskUpdated, this,
+            [this](const QString &id, qreal progress, const QString &status, const QString &checksum) {
+        m_transferStore.updateState(id, progress, status, QByteArray::fromHex(checksum.toLatin1()));
+    });
+    connect(this, &TransferManager::taskSizeResolved, this,
+            [this](const QString &id, qint64 totalBytes) {
+        m_transferStore.updateSize(id, totalBytes);
+    });
+    QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
+    m_localId = settings.value(QStringLiteral("identity/instanceId")).toString();
+    if (m_localId.isEmpty()) {
+        m_localId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        settings.setValue(QStringLiteral("identity/instanceId"), m_localId);
+    }
+    loadTrustedPeers();
+#ifdef Q_OS_ANDROID
+    m_saveDirectory = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
+                          .filePath(QStringLiteral("Received"));
 #else
     m_saveDirectory = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
 #endif
-
+    QDir().mkpath(m_saveDirectory);
     m_server = new QTcpServer(this);
-    m_server->listen(QHostAddress::AnyIPv4, 0);
+    if (!m_server->listen(QHostAddress::AnyIPv4, 0))
+        emit transferError(tr("无法启动文件接收服务：%1").arg(m_server->errorString()));
     connect(m_server, &QTcpServer::newConnection, this, &TransferManager::onNewConnection);
-
+    auto *keepAlive = new QTimer(this);
+    keepAlive->setInterval(15000);
+    connect(keepAlive, &QTimer::timeout, this, [this] {
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        QList<QTcpSocket *> stale;
+        for (auto it = m_sessions.cbegin(); it != m_sessions.cend(); ++it) {
+            auto *socket = it.value().data();
+            auto *context = socket ? m_tasks.value(socket) : nullptr;
+            if (!socket || !context || socket->state() != QAbstractSocket::ConnectedState)
+                continue;
+            if (context->lastActivityMs > 0 && now - context->lastActivityMs > SessionTimeoutMs)
+                stale.append(socket);
+            else
+                sendPacket(socket, MsgPing);
+        }
+        for (auto *socket : std::as_const(stale)) cleanupSocket(socket);
+    });
+    keepAlive->start();
 }
 
-void TransferManager::setSaveDirectory(const QString &dirUrl)
+QString TransferManager::stateName(ConnectionState state)
 {
-    QString localPath = dirUrl;
-
-    if (dirUrl.startsWith("file://")) {
-        localPath = QUrl(dirUrl).toLocalFile();
+    switch (state) {
+    case ConnectionState::Unpaired: return QStringLiteral("unpaired");
+    case ConnectionState::Pairing: return QStringLiteral("pairing");
+    case ConnectionState::Online: return QStringLiteral("online");
+    case ConnectionState::Reconnecting: return QStringLiteral("reconnecting");
+    case ConnectionState::Offline: return QStringLiteral("offline");
     }
+    return QStringLiteral("unpaired");
+}
 
+QString TransferManager::connectionState(const QString &peerId) const
+{
+    return stateName(m_connections.value(peerId).state);
+}
+
+void TransferManager::setConnectionState(const QString &peerId, ConnectionState state)
+{
+    if (peerId.isEmpty()) return;
+    auto &peer = m_connections[peerId];
+    if (peer.state == state) return;
+    peer.state = state;
+    qInfo() << "Peer connection state" << peerId << stateName(state);
+    emit pairingStateChanged(peerId, stateName(state));
+    emit peerAuthorizationChanged(peerId, peer.ip, state == ConnectionState::Online);
+    if (state == ConnectionState::Online) {
+        for (auto it = m_pendingOutgoing.cbegin(); it != m_pendingOutgoing.cend(); ++it)
+            if (it->transfer.peerId == peerId) m_transferRetryAttempts[it.key()] = 0;
+        QTimer::singleShot(0, this, [this, peerId] { resumePendingTransfers(peerId); });
+    }
+}
+
+void TransferManager::loadTrustedPeers()
+{
+    QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
+    settings.beginGroup(QStringLiteral("trustedPeers"));
+    for (const QString &peerId : settings.childGroups()) {
+        settings.beginGroup(peerId);
+        PeerConnection peer;
+        peer.name = settings.value(QStringLiteral("name")).toString();
+        peer.ip = settings.value(QStringLiteral("ip")).toString();
+        peer.port = quint16(settings.value(QStringLiteral("port")).toUInt());
+        peer.trusted = true;
+        peer.state = ConnectionState::Offline;
+        m_connections.insert(peerId, peer);
+        settings.endGroup();
+    }
+    settings.endGroup();
+}
+
+bool TransferManager::isTrusted(const QString &peerId) const
+{
+    return m_connections.contains(peerId) && m_connections.value(peerId).trusted;
+}
+
+void TransferManager::saveTrustedPeer(const QString &peerId, const QString &name,
+                                      const QString &ip, quint16 port)
+{
+    auto &peer = m_connections[peerId];
+    peer.trusted = true;
+    peer.name = name;
+    peer.ip = ip;
+    if (port) peer.port = port;
+    QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
+    settings.beginGroup(QStringLiteral("trustedPeers"));
+    settings.beginGroup(peerId);
+    settings.setValue(QStringLiteral("name"), peer.name);
+    settings.setValue(QStringLiteral("ip"), peer.ip);
+    settings.setValue(QStringLiteral("port"), peer.port);
+    settings.endGroup();
+    settings.endGroup();
+}
+
+void TransferManager::removeTrustedPeer(const QString &peerId)
+{
+    if (m_connections.contains(peerId)) m_connections[peerId].trusted = false;
+    QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
+    settings.beginGroup(QStringLiteral("trustedPeers"));
+    settings.remove(peerId);
+    settings.endGroup();
+}
+
+bool TransferManager::isPaired(const QString &peerId) const
+{
+    const auto socket = m_sessions.value(peerId);
+    const auto *context = socket ? m_tasks.value(socket) : nullptr;
+    return m_connections.value(peerId).state == ConnectionState::Online
+        && socket && context && context->paired
+        && socket->state() == QAbstractSocket::ConnectedState;
+}
+
+bool TransferManager::isPairedIp(const QString &ip) const
+{
+    for (auto it = m_sessions.cbegin(); it != m_sessions.cend(); ++it) {
+        auto *socket = it.value().data();
+        auto *context = socket ? m_tasks.value(socket) : nullptr;
+        if (context && context->paired && context->peerIp == ip
+            && socket->state() == QAbstractSocket::ConnectedState) return true;
+    }
+    return false;
+}
+
+QString TransferManager::peerIdForIp(const QString &ip) const
+{
+    for (auto it = m_sessions.cbegin(); it != m_sessions.cend(); ++it) {
+        auto *socket = it.value().data();
+        auto *context = socket ? m_tasks.value(socket) : nullptr;
+        if (context && context->paired && context->peerIp == ip) return it.key();
+    }
+    return {};
+}
+
+void TransferManager::requestPairing(const QString &peerId, const QString &peerName,
+                                     const QString &ip, quint16 port)
+{
+    if (!isValidPeerId(peerId) || ip.isEmpty() || port == 0) {
+        emit transferError(tr("无法向该设备发起配对"));
+        return;
+    }
+    if (isPaired(peerId)) {
+        emit pairingStateChanged(peerId, stateName(ConnectionState::Online));
+        return;
+    }
+    for (auto *item : std::as_const(m_tasks)) {
+        if (item->isControl && item->peerId == peerId) {
+            emit pairingStateChanged(peerId, connectionState(peerId));
+            return;
+        }
+    }
+    const bool reconnecting = isTrusted(peerId);
+    auto &peer = m_connections[peerId];
+    peer.name = peerName;
+    peer.ip = ip;
+    peer.port = port;
+    openControlConnection(peerId, peerName, ip, port, reconnecting);
+}
+
+void TransferManager::openControlConnection(const QString &peerId, const QString &peerName,
+                                            const QString &ip, quint16 port, bool reconnecting)
+{
+    auto *socket = new QTcpSocket(this);
+    auto *context = new TransferContext;
+    context->isControl = true;
+    context->isSender = true;
+    context->peerId = peerId;
+    context->peerName = peerName;
+    context->peerIp = ip;
+    context->peerPort = port;
+    context->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+    m_tasks[socket] = context;
+    socket->setSocketOption(QAbstractSocket::KeepAliveOption, 1);
+    connect(socket, &QTcpSocket::connected, this, [this, socket] {
+        auto *item = m_tasks.value(socket);
+        if (!item) return;
+        QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
+        const QString localName = settings.value(QStringLiteral("identity/deviceName"),
+                                                  QHostInfo::localHostName()).toString();
+        sendPacket(socket, MsgPairRequest, [this, localName](QDataStream &out) {
+            out << m_localId << localName << serverPort();
+        });
+    });
+    connect(socket, &QTcpSocket::readyRead, this, [this, socket] { onReadyRead(socket); });
+    connect(socket, &QTcpSocket::disconnected, this, [this, socket] {
+        if (m_tasks.contains(socket)) cleanupSocket(socket);
+    });
+    connect(socket, &QTcpSocket::errorOccurred, this,
+            [this, socket, peerId](QAbstractSocket::SocketError) {
+        if (!m_tasks.contains(socket)) return;
+        cleanupSocket(socket);
+    });
+    setConnectionState(peerId, reconnecting ? ConnectionState::Reconnecting
+                                             : ConnectionState::Pairing);
+    socket->connectToHost(ip, port);
+}
+
+void TransferManager::acceptPairing(const QString &peerId)
+{
+    for (auto it = m_tasks.cbegin(); it != m_tasks.cend(); ++it) {
+        auto *item = it.value();
+        if (!item->isControl || item->isSender || item->peerId != peerId || item->paired) continue;
+        item->paired = true;
+        const bool adopted = establishSession(it.key(), item);
+        QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
+        const QString localName = settings.value(QStringLiteral("identity/deviceName"),
+                                                  QHostInfo::localHostName()).toString();
+        sendPacket(it.key(), MsgPairAccept, [this, localName](QDataStream &out) {
+            out << m_localId << localName << serverPort();
+        });
+        if (!adopted) {
+            it.key()->flush();
+            it.key()->disconnectFromHost();
+        }
+        return;
+    }
+}
+
+void TransferManager::rejectPairing(const QString &peerId)
+{
+    for (auto it = m_tasks.cbegin(); it != m_tasks.cend(); ++it) {
+        auto *item = it.value();
+        if (!item->isControl || item->isSender || item->peerId != peerId || item->paired) continue;
+        sendPacket(it.key(), MsgPairReject);
+        removeTrustedPeer(peerId);
+        setConnectionState(peerId, ConnectionState::Unpaired);
+        it.key()->flush();
+        it.key()->disconnectFromHost();
+        return;
+    }
+}
+
+void TransferManager::forgetPeer(const QString &peerId)
+{
+    ++m_connections[peerId].reconnectGeneration;
+    removeTrustedPeer(peerId);
+    setConnectionState(peerId, ConnectionState::Unpaired);
+    if (auto *socket = m_sessions.take(peerId).data()) cleanupSocket(socket);
+    m_connections.remove(peerId);
+}
+
+void TransferManager::deviceAvailable(const QString &peerId, const QString &peerName,
+                                      const QString &ip, quint16 port)
+{
+    if (!isTrusted(peerId) || ip.isEmpty() || port == 0) return;
+    auto &peer = m_connections[peerId];
+    const bool endpointChanged = peer.ip != ip || peer.port != port || peer.name != peerName;
+    peer.name = peerName;
+    peer.ip = ip;
+    peer.port = port;
+    if (endpointChanged) saveTrustedPeer(peerId, peerName, ip, port);
+    if (peer.state != ConnectionState::Offline) return;
+    for (auto *context : std::as_const(m_tasks))
+        if (context->isControl && context->peerId == peerId) return;
+    peer.reconnectAttempt = 0;
+    openControlConnection(peerId, peerName, ip, port, true);
+}
+
+void TransferManager::setSaveDirectory(const QString &value)
+{
+    const QUrl url(value);
 #ifdef Q_OS_ANDROID
-    // 特殊处理：Android 的路径转换极其复杂
-    // 如果路径包含 "primary:" 这种特征，通常需要手动映射
-    if (localPath.contains("primary:")) {
-        QString subPath = localPath.split("primary:").last();
-        localPath = "/storage/emulated/0/" + subPath;
+    if (url.scheme() == QStringLiteral("content")) {
+        const QString uri = url.toString(QUrl::FullyEncoded);
+        if (!persistAndroidDirectory(uri)) {
+            emit transferError(tr("无法获得所选目录的长期读写权限"));
+            return;
+        }
+        if (uri == m_saveDirectory) return;
+        m_saveDirectory = uri;
+        emit saveDirectoryChanged();
+        return;
     }
 #endif
-
-    m_saveDirectory = localPath;
+    const QString path = url.isLocalFile() ? url.toLocalFile()
+                                           : (url.scheme().isEmpty() ? value : QString{});
+    if (path.isEmpty()) {
+        emit transferError(tr("当前版本仅支持可直接写入的本地目录"));
+        return;
+    }
+    if (QDir::cleanPath(path) == QDir::cleanPath(m_saveDirectory))
+        return;
+    if (!QDir().mkpath(path) || !QFileInfo(path).isDir() || !QFileInfo(path).isWritable()) {
+        emit transferError(tr("接收目录不可写：%1").arg(path));
+        return;
+    }
+    m_saveDirectory = QDir::cleanPath(path);
     emit saveDirectoryChanged();
-    qDebug() << "最终写入路径:" << m_saveDirectory;
 }
 
-// ================= 发送端并发逻辑 =================
-void TransferManager::sendFiles(const QList<QUrl>  &fileUrls, const QString &ip, quint16 port)
+void TransferManager::sendPacket(QTcpSocket *socket, MessageType type,
+                                 const std::function<void(QDataStream &)> &write)
 {
-    for (const QUrl &url : fileUrls) {
+    if (!socket || socket->state() == QAbstractSocket::UnconnectedState)
+        return;
+    QByteArray packet;
+    QDataStream out(&packet, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_5);
+    out << quint32(0) << quint8(type);
+    if (write)
+        write(out);
+    out.device()->seek(0);
+    out << quint32(packet.size() - sizeof(quint32));
+    socket->write(packet);
+}
 
-        QString filePath;
-        QString fileName;
-
-        if (url.isLocalFile()) {
-            // Windows/Mac/Linux 桌面端正常处理
-            filePath = url.toLocalFile();
-            fileName = QFileInfo(filePath).fileName();
-        } else {
-            // Android 端处理 (url 格式为 content://...)
-            filePath = url.toString();
-
-#ifdef Q_OS_ANDROID
-            // 调用底层 Android API 查询真实的带后缀的文件名
-            fileName = getAndroidContentName(filePath);
-#endif
-            // 兜底方案：如果查询失败，给一个基于时间戳的名字避免覆盖
-            if (fileName.isEmpty()) {
-                fileName = QString("AndroidFile_%1.bin").arg(QDateTime::currentMSecsSinceEpoch());
-            }
-        }
-
-        if (filePath.isEmpty()) {
-            qWarning() << "无效的文件路径，跳过:" << url;
-            continue;
-        }
-
-        QTcpSocket *socket = new QTcpSocket(this);
-
-        TransferContext *ctx = new TransferContext();
-        ctx->id = QUuid::createUuid().toString();
-        ctx->isSender = true;
-        ctx->fileName = fileName;
-        ctx->totalBytes = 0;
-
-        ctx->file = new QFile(filePath, this);
-        m_tasks[socket] = ctx;
-
-        // 尝试打开文件
-        if (!ctx->file->open(QIODevice::ReadOnly)) {
-            emit taskAdded(ctx->id, ctx->fileName, true, 0);
-            emit taskUpdated(ctx->id, 0.0, "无读取权限");
-            m_tasks.remove(socket);
-            delete ctx->file;
-            ctx->file = nullptr;
-            delete ctx;
-            socket->deleteLater();
-            continue;
-        }
-
-        // 打开成功后，获取真实大小并通知 UI
-        ctx->totalBytes = ctx->file->size();
-        emit taskAdded(ctx->id, ctx->fileName, true, ctx->totalBytes);
-        emit taskUpdated(ctx->id, 0.0, "等待连接...");
-
-        connect(socket, &QTcpSocket::connected, this, [this, socket, ctx]() {
-            emit taskUpdated(ctx->id, 0.0, "正在发送...");
-            QByteArray block;
-            QDataStream out(&block, QIODevice::WriteOnly);
-            out.setVersion(QDataStream::Qt_6_5);
-            out << (quint32)0 << (quint8)MsgFileInfo << ctx->fileName << ctx->totalBytes;
-            out.device()->seek(0);
-            out << (quint32)(block.size() - sizeof(quint32));
-            socket->write(block);
-            sendNextChunk(socket);
-        });
-
-        connect(socket, &QTcpSocket::bytesWritten, this, [this, socket, ctx](qint64) {
-            if (ctx->file && ctx->file->isOpen()) {
-                sendNextChunk(socket);
-            } else if (socket->bytesToWrite() == 0) {
-                cleanupSocket(socket, "发送完成");
-            }
-        });
-
-        connect(socket, &QTcpSocket::disconnected, this, &TransferManager::onSocketDisconnected);
-        connect(socket, &QTcpSocket::errorOccurred, this, [this, socket](QAbstractSocket::SocketError error){
-            QString errorMsg = "网络错误: " + socket->errorString();
-            cleanupSocket(socket, errorMsg);
-        });
-
-        socket->connectToHost(ip, port);
+void TransferManager::sendFiles(const QList<QUrl> &urls, const QString &ip, quint16 port)
+{
+    if (ip.isEmpty() || port == 0) {
+        emit transferError(tr("目标设备地址无效"));
+        return;
+    }
+    if (!isPairedIp(ip)) {
+        emit transferError(tr("请先与该设备配对"));
+        return;
+    }
+    const QString peerId = peerIdForIp(ip);
+    if (peerId.isEmpty()) {
+        emit transferError(tr("无法识别目标设备"));
+        return;
+    }
+    const PeerConnection peer = m_connections.value(peerId);
+    for (const QUrl &url : urls) {
+        const QString path = url.isLocalFile() ? url.toLocalFile() : url.toString();
+        QString name = url.fileName().isEmpty() ? QFileInfo(path).fileName() : url.fileName();
+        if (name.isEmpty())
+            name = QStringLiteral("file-%1.bin").arg(QDateTime::currentMSecsSinceEpoch());
+        const qint64 knownSize = url.isLocalFile() ? QFileInfo(path).size() : 0;
+        PersistedTransfer transfer;
+        transfer.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        transfer.peerId = peerId;
+        transfer.peerName = peer.name;
+        transfer.peerIp = ip;
+        transfer.peerPort = port;
+        transfer.isSender = true;
+        transfer.sourcePath = path;
+        transfer.fileName = name;
+        transfer.totalBytes = qMax<qint64>(0, knownSize);
+        transfer.status = QStringLiteral("verifying");
+        transfer.createdAt = QDateTime::currentMSecsSinceEpoch();
+        m_transferStore.upsert(transfer);
+        emit taskAdded(transfer.id, ip, name, true, transfer.totalBytes);
+        emit taskUpdated(transfer.id, 0, transfer.status, {});
+        beginOutgoingTransfer(transfer, true);
     }
 }
 
+void TransferManager::restoreTransfers()
+{
+    if (m_transfersRestored) return;
+    m_transfersRestored = true;
+    m_transferStore.markRunningTasksPaused();
+    const auto transfers = m_transferStore.unfinished();
+    for (PersistedTransfer transfer : transfers) {
+        transfer.status = QStringLiteral("paused");
+        if (!transfer.isSender && !transfer.partialPath.isEmpty() && transfer.totalBytes > 0)
+            transfer.progress = qBound<qreal>(0, qreal(QFileInfo(transfer.partialPath).size())
+                                                 / transfer.totalBytes, 1);
+        m_transferStore.upsert(transfer);
+        emit taskRestored(transfer.id, transfer.peerId, transfer.peerName, transfer.peerIp,
+                          transfer.fileName, transfer.isSender, transfer.totalBytes,
+                          transfer.progress, transfer.status, transfer.checksum.toHex());
+        if (transfer.isSender) enqueueOutgoing(transfer, true);
+    }
+    for (auto it = m_connections.cbegin(); it != m_connections.cend(); ++it)
+        if (it->state == ConnectionState::Online) resumePendingTransfers(it.key());
+}
+
+void TransferManager::enqueueOutgoing(const PersistedTransfer &transfer, bool validateSource)
+{
+    m_activeTransferIds.remove(transfer.id);
+    m_pendingOutgoing.insert(transfer.id, PendingOutgoing{transfer, validateSource});
+}
+
+void TransferManager::resumePendingTransfers(const QString &peerId)
+{
+    if (!m_transfersRestored && m_pendingOutgoing.isEmpty()) return;
+    QStringList ids;
+    for (auto it = m_pendingOutgoing.cbegin(); it != m_pendingOutgoing.cend(); ++it)
+        if (it->transfer.peerId == peerId) ids.append(it.key());
+    for (const QString &id : std::as_const(ids)) {
+        const PendingOutgoing pending = m_pendingOutgoing.take(id);
+        beginOutgoingTransfer(pending.transfer, pending.validateSource);
+    }
+}
+
+void TransferManager::beginOutgoingTransfer(PersistedTransfer transfer, bool validateSource)
+{
+    if (m_activeTransferIds.contains(transfer.id)) return;
+    if (!isPaired(transfer.peerId)) {
+        transfer.status = QStringLiteral("paused");
+        m_transferStore.upsert(transfer);
+        enqueueOutgoing(transfer, validateSource);
+        emit taskUpdated(transfer.id, transfer.progress, transfer.status, transfer.checksum.toHex());
+        return;
+    }
+    m_activeTransferIds.insert(transfer.id);
+    if (!validateSource && transfer.checksum.size() == 32 && transfer.totalBytes >= 0) {
+        openOutgoingSocket(transfer);
+        return;
+    }
+    emit taskUpdated(transfer.id, transfer.progress, QStringLiteral("verifying"), transfer.checksum.toHex());
+    auto *watcher = new QFutureWatcher<DigestResult>(this);
+    connect(watcher, &QFutureWatcher<DigestResult>::finished, this,
+            [this, watcher, transfer, validateSource]() mutable {
+        const DigestResult digest = watcher->result();
+        watcher->deleteLater();
+        if (m_cancelledTransferIds.remove(transfer.id)) return;
+        if (!digest.error.isEmpty() || digest.size < 0
+            || (validateSource && !transfer.checksum.isEmpty()
+                && (transfer.checksum != digest.hash || transfer.totalBytes != digest.size))) {
+            m_activeTransferIds.remove(transfer.id);
+            emit taskUpdated(transfer.id, transfer.progress, QStringLiteral("read-error"), {});
+            emit transferError(tr("无法恢复发送 %1：源文件不可用或已发生变化").arg(transfer.fileName));
+            return;
+        }
+        transfer.totalBytes = digest.size;
+        transfer.checksum = digest.hash;
+        transfer.status = QStringLiteral("connecting");
+        const auto peer = m_connections.value(transfer.peerId);
+        transfer.peerName = peer.name;
+        transfer.peerIp = peer.ip;
+        transfer.peerPort = peer.port;
+        m_transferStore.upsert(transfer);
+        emit taskSizeResolved(transfer.id, digest.size);
+        openOutgoingSocket(transfer);
+    });
+    watcher->setFuture(QtConcurrent::run(calculateDigest, transfer.sourcePath));
+}
+
+void TransferManager::openOutgoingSocket(PersistedTransfer transfer)
+{
+    if (!isPaired(transfer.peerId)) {
+        transfer.status = QStringLiteral("paused");
+        m_transferStore.upsert(transfer);
+        enqueueOutgoing(transfer, false);
+        emit taskUpdated(transfer.id, transfer.progress, transfer.status, transfer.checksum.toHex());
+        return;
+    }
+    const PeerConnection peer = m_connections.value(transfer.peerId);
+    auto *socket = new QTcpSocket(this);
+    auto *context = new TransferContext;
+    context->id = transfer.id;
+    context->isSender = true;
+    context->peerId = transfer.peerId;
+    context->peerName = peer.name;
+    context->peerIp = peer.ip;
+    context->peerPort = peer.port;
+    context->sourcePath = transfer.sourcePath;
+    context->fileName = transfer.fileName;
+    context->totalBytes = transfer.totalBytes;
+    context->checksum = transfer.checksum;
+    context->file = new QFile(transfer.sourcePath, this);
+    m_tasks[socket] = context;
+    if (!context->file->open(QIODevice::ReadOnly)) {
+        m_activeTransferIds.remove(transfer.id);
+        emit taskUpdated(transfer.id, transfer.progress, QStringLiteral("read-error"), {});
+        cleanupSocket(socket);
+        return;
+    }
+    emit taskUpdated(transfer.id, transfer.progress, QStringLiteral("connecting"), transfer.checksum.toHex());
+    connect(socket, &QTcpSocket::connected, this, [this, socket, context] {
+        sendPacket(socket, MsgFileOffer, [context](QDataStream &out) {
+            out << context->id << context->fileName << context->totalBytes << context->checksum;
+        });
+        emit taskUpdated(context->id, 0, QStringLiteral("negotiating"), context->checksum.toHex());
+    });
+    connect(socket, &QTcpSocket::readyRead, this, [this, socket] { onReadyRead(socket); });
+    connect(socket, &QTcpSocket::bytesWritten, this, [this, socket](qint64) { sendNextChunk(socket); });
+    connect(socket, &QTcpSocket::disconnected, this, [this, socket] {
+        if (auto *item = m_tasks.value(socket))
+            cleanupSocket(socket, item->completionSent ? QString{} : QStringLiteral("paused"), true);
+    });
+    connect(socket, &QTcpSocket::errorOccurred, this,
+            [this, socket](QAbstractSocket::SocketError) {
+        if (m_tasks.contains(socket)) cleanupSocket(socket, QStringLiteral("paused"), true);
+    });
+    socket->connectToHost(peer.ip, peer.port);
+}
 
 void TransferManager::sendNextChunk(QTcpSocket *socket)
 {
-    TransferContext *ctx = m_tasks.value(socket, nullptr);
-    if (!ctx || !ctx->file || !ctx->file->isOpen()) return;
-
-    // 如果底层的发送缓冲区还有超过 2MB 数据没发出去，就暂时不读本地文件
-    // 直接返回。当底层把缓冲区数据发出去后，会自动再次触发 bytesWritten 信号并进入这里
-    if (socket->bytesToWrite() > 2 * 1024 * 1024) return;
-
-    //加个循环一次性多写入几块，以填满底层缓冲区，提升局域网千兆传输速度
-    while (socket->bytesToWrite() <= 2 * 1024 * 1024 && !ctx->file->atEnd()) {
-        QByteArray payload = ctx->file->read(256 * 1024); // 256KB 块
-
-        QByteArray block;
-        QDataStream out(&block, QIODevice::WriteOnly);
-        out.setVersion(QDataStream::Qt_6_5);
-        out << (quint32)0 << (quint8)MsgFileData << payload;
-        out.device()->seek(0);
-        out << (quint32)(block.size() - sizeof(quint32));
-        socket->write(block);
-
-        qreal p = (qreal)ctx->file->pos() / (qreal)ctx->totalBytes;
-        int currentPct = static_cast<int>(p * 100);
-        // 只有当百分比增加（即跨越 1%），或者到达 100% 时，才通知 UI
-        if (currentPct > ctx->lastProgressPct || p >= 1.0) {
-            ctx->lastProgressPct = currentPct;
-            emit taskUpdated(ctx->id, p, ctx->isSender ? "传输中..." : "接收中...");
-        }
-    }
-
-    if (ctx->file->atEnd()) {
-        ctx->file->close();
-        ctx->file->deleteLater();
-        ctx->file = nullptr;
-        emit taskUpdated(ctx->id, 1.0, "等待网络同步...");
-    }
-}
-
-// ================= 接收端并发逻辑 =================
-void TransferManager::onNewConnection()
-{
-    QTcpSocket *socket = m_server->nextPendingConnection();
-
-    // 新连接到来，创建接收上下文
-    TransferContext *ctx = new TransferContext();
-    ctx->id = QUuid::createUuid().toString();
-    ctx->isSender = false;
-    m_tasks[socket] = ctx;
-
-    connect(socket, &QTcpSocket::readyRead, this, &TransferManager::onReadyRead);
-    connect(socket, &QTcpSocket::disconnected, this, &TransferManager::onSocketDisconnected);
-    connect(socket, &QTcpSocket::errorOccurred, this, [this, socket](QAbstractSocket::SocketError error){
-        QString errorMsg = "接收中断: " + socket->errorString();
-        cleanupSocket(socket, errorMsg);
-    });
-}
-
-void TransferManager::onReadyRead()
-{
-    QTcpSocket *socket = qobject_cast<QTcpSocket*>(sender());
-    TransferContext *ctx = m_tasks.value(socket, nullptr);
-    if (!ctx) return;
-
-    QDataStream in(socket);
-    in.setVersion(QDataStream::Qt_6_5);
-
-    while (true) {
-        if (ctx->blockSize == 0) {
-            if (socket->bytesAvailable() < sizeof(quint32)) return;
-            in >> ctx->blockSize;
-        }
-        if (socket->bytesAvailable() < ctx->blockSize) return;
-
-        QByteArray packetData = socket->read(ctx->blockSize);
-        QDataStream packetStream(&packetData, QIODevice::ReadOnly);
-        packetStream.setVersion(QDataStream::Qt_6_5);
-
-        quint8 msgType;
-        packetStream >> msgType;
-
-        if (msgType == MsgText) {
-            QString text;
-               packetStream >> text;
-            // 获取发送方 IP 并清理 IPv6 映射前缀
-            QString senderIp = socket->peerAddress().toString();
-            senderIp.remove("::ffff:");
-
-            emit textReceived(senderIp, text);
-            cleanupSocket(socket); // 接收完毕，直接清理该连接
+    auto *context = m_tasks.value(socket);
+    if (!context || !context->isSender || !context->offerAccepted || !context->file
+        || !context->file->isOpen())
+        return;
+    while (socket->bytesToWrite() < 2 * 1024 * 1024 && !context->sourceEof) {
+        const QByteArray data = context->file->read(256 * 1024);
+        if (data.isEmpty() && context->file->error() != QFileDevice::NoError) {
+            cleanupSocket(socket, QStringLiteral("read-error"), true);
             return;
         }
-        else if (msgType == MsgFileInfo) {
-            packetStream  >> ctx->fileName >> ctx->totalBytes;
-            emit taskAdded(ctx->id, ctx->fileName, false, ctx->totalBytes);
-            emit taskUpdated(ctx->id, 0.0, "准备接收...");
+        if (data.isEmpty()) {
+            context->sourceEof = true;
+            break;
+        }
+        sendPacket(socket, MsgFileData, [context, data](QDataStream &out) { out << context->id << data; });
+        const qreal progress = context->totalBytes ? qreal(context->file->pos()) / context->totalBytes : 1;
+        const int percent = int(progress * 100);
+        if (percent > context->lastProgressPct) {
+            context->lastProgressPct = percent;
+            emit taskUpdated(context->id, progress, QStringLiteral("transferring"), context->checksum.toHex());
+        }
+    }
+    if (context->sourceEof && !context->completionSent && socket->bytesToWrite() == 0) {
+        context->completionSent = true;
+        sendPacket(socket, MsgComplete, [context](QDataStream &out) {
+            out << context->id << true << context->checksum;
+        });
+        emit taskUpdated(context->id, 1, QStringLiteral("verifying"), context->checksum.toHex());
+    }
+}
 
-            QDir dir(m_saveDirectory);
-            if (!dir.exists()) {
-                dir.mkpath(".");
-            }
+void TransferManager::onNewConnection()
+{
+    while (m_server->hasPendingConnections()) {
+        auto *socket = m_server->nextPendingConnection();
+        auto *context = new TransferContext;
+        context->peerIp = socket->peerAddress().toString().remove(QStringLiteral("::ffff:"));
+        m_tasks[socket] = context;
+        connect(socket, &QTcpSocket::readyRead, this, [this, socket] { onReadyRead(socket); });
+        connect(socket, &QTcpSocket::disconnected, this, [this, socket] {
+            if (auto *item = m_tasks.value(socket))
+                cleanupSocket(socket, item->isControl || item->completionSent ? QString{} : QStringLiteral("paused"), true);
+        });
+        connect(socket, &QTcpSocket::errorOccurred, this,
+                [this, socket](QAbstractSocket::SocketError) {
+            if (m_tasks.contains(socket))
+                cleanupSocket(socket, m_tasks.value(socket)->isControl ? QString{} : QStringLiteral("paused"), true);
+        });
+    }
+}
 
-            QString savePath = QDir(m_saveDirectory).filePath(ctx->fileName);
-            QFileInfo fileInfo(savePath);
-            int counter = 1;
-            while (fileInfo.exists()) {
-                QString newName = QString("%1(%2).%3")
-                .arg(fileInfo.completeBaseName())
-                    .arg(counter++)
-                    .arg(fileInfo.suffix());
-                savePath = QDir(m_saveDirectory).filePath(newName);
-                fileInfo.setFile(savePath);
-            }
-            ctx->file = new QFile(savePath, this);
-            if (!ctx->file->open(QIODevice::WriteOnly)) {
-                QString errorMsg = "写入失败: " + ctx->file->errorString();
-                qWarning() << "无法创建文件:" << savePath << " 原因:" << ctx->file->errorString();
-                cleanupSocket(socket, errorMsg);
+void TransferManager::onReadyRead(QTcpSocket *socket)
+{
+    auto *context = m_tasks.value(socket);
+    if (!context)
+        return;
+    QDataStream in(socket);
+    in.setVersion(QDataStream::Qt_6_5);
+    const auto fail = [this, socket] { cleanupSocket(socket, QStringLiteral("protocol-error"), false); };
+    while (true) {
+        if (!context->blockSize) {
+            if (socket->bytesAvailable() < qint64(sizeof(quint32)))
+                return;
+            in >> context->blockSize;
+            if (context->blockSize < 1 || context->blockSize > MaxPacketSize) {
+                fail();
                 return;
             }
         }
-        else if (msgType == MsgFileData) {
-            QByteArray payload;
-            packetStream  >> payload;
-            if (ctx->file && ctx->file->isOpen()) {
-                ctx->file->write(payload);
-                qreal p = (qreal)ctx->file->pos() / (qreal)ctx->totalBytes;
-                int currentPct = static_cast<int>(p * 100);
-                if (currentPct > ctx->lastProgressPct || p >= 1.0) {
-                    ctx->lastProgressPct = currentPct;
-                    emit taskUpdated(ctx->id, p, "接收中...");
+        if (socket->bytesAvailable() < context->blockSize)
+            return;
+        const QByteArray raw = socket->read(context->blockSize);
+        context->blockSize = 0;
+        context->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+        QDataStream packet(raw);
+        packet.setVersion(QDataStream::Qt_6_5);
+        quint8 type = 0;
+        packet >> type;
+        if (packet.status() != QDataStream::Ok) {
+            fail();
+            return;
+        }
+        if (type == MsgPairRequest) {
+            QString peerId, peerName;
+            packet >> peerId >> peerName;
+            quint16 peerPort = 0;
+            if (!packet.atEnd()) packet >> peerPort;
+            if (packet.status() != QDataStream::Ok || !isValidPeerId(peerId) || peerId == m_localId
+                || peerName.trimmed().isEmpty() || peerName.size() > 80) {
+                fail(); return;
+            }
+            context->isControl = true;
+            context->peerId = peerId;
+            context->peerName = peerName.trimmed();
+            context->peerPort = peerPort;
+            socket->setSocketOption(QAbstractSocket::KeepAliveOption, 1);
+            qInfo() << "Incoming pairing request from" << context->peerName << context->peerIp
+                    << "peerId" << peerId;
+            if (isTrusted(peerId)) {
+                auto &peer = m_connections[peerId];
+                peer.name = context->peerName;
+                peer.ip = context->peerIp;
+                if (peerPort) peer.port = peerPort;
+                setConnectionState(peerId, ConnectionState::Reconnecting);
+                acceptPairing(peerId);
+            } else {
+                setConnectionState(peerId, ConnectionState::Pairing);
+                emit pairingRequested(peerId, context->peerName, context->peerIp);
+            }
+        } else if (type == MsgPairAccept) {
+            QString peerId, peerName;
+            packet >> peerId >> peerName;
+            quint16 peerPort = 0;
+            if (!packet.atEnd()) packet >> peerPort;
+            if (packet.status() != QDataStream::Ok || !context->isControl || !context->isSender
+                || peerId != context->peerId || peerName.size() > 80) {
+                fail(); return;
+            }
+            context->peerName = peerName.trimmed();
+            if (peerPort) context->peerPort = peerPort;
+            context->paired = true;
+            if (!establishSession(socket, context)) {
+                cleanupSocket(socket);
+                return;
+            }
+        } else if (type == MsgPairReject) {
+            if (!context->isControl) { fail(); return; }
+            removeTrustedPeer(context->peerId);
+            setConnectionState(context->peerId, ConnectionState::Unpaired);
+            cleanupSocket(socket);
+            return;
+        } else if (type == MsgPing) {
+            if (!context->isControl || !context->paired) { fail(); return; }
+            sendPacket(socket, MsgPong);
+        } else if (type == MsgPong) {
+            if (!context->isControl || !context->paired) { fail(); return; }
+        } else if (type == MsgText) {
+            QString text;
+            packet >> text;
+            if (packet.status() != QDataStream::Ok || text.size() > MaxTextLength
+                || (context->isControl && !context->paired)) {
+                fail(); return;
+            }
+            emit textReceived(context->peerIp, text);
+            if (!context->isControl) {
+                cleanupSocket(socket);
+                return;
+            }
+        } else if (type == MsgFileOffer) {
+            if (!isPairedIp(context->peerIp)) { fail(); return; }
+            packet >> context->id >> context->fileName >> context->totalBytes >> context->checksum;
+            context->fileName = QFileInfo(context->fileName).fileName();
+            if (packet.status() != QDataStream::Ok || context->id.isEmpty() || context->fileName.isEmpty()
+                || context->fileName.size() > 255 || context->totalBytes < 0
+                || context->checksum.size() != 32) {
+                fail(); return;
+            }
+            context->peerId = peerIdForIp(context->peerIp);
+            if (context->peerId.isEmpty()) { fail(); return; }
+            const PeerConnection peer = m_connections.value(context->peerId);
+            context->peerName = peer.name;
+            context->peerPort = peer.port;
+            const auto saved = m_transferStore.find(context->id);
+            if (saved) {
+                if (saved->isSender || saved->peerId != context->peerId
+                    || saved->fileName != context->fileName || saved->totalBytes != context->totalBytes
+                    || saved->checksum != context->checksum) {
+                    fail(); return;
                 }
-
-                if (ctx->file->pos() >= ctx->totalBytes) {
-                    cleanupSocket(socket, "接收完成");
+                if (saved->status == QStringLiteral("verified")) {
+                    emit taskAdded(context->id, context->peerIp, context->fileName, false,
+                                   context->totalBytes);
+                    emit taskUpdated(context->id, 1, QStringLiteral("verified"),
+                                     context->checksum.toHex());
+                    context->completionSent = true;
+                    sendPacket(socket, MsgComplete, [context](QDataStream &out) {
+                        out << context->id << true << context->checksum;
+                    });
+                    socket->flush();
+                    socket->disconnectFromHost();
                     return;
                 }
+                context->partialPath = saved->partialPath;
+                context->finalPath = saved->finalPath;
+                if (context->partialPath.isEmpty() || (!QFileInfo::exists(context->partialPath)
+                    && QFileInfo::exists(context->finalPath))) {
+                    const QString receivePath = storagePath();
+                    context->partialPath = QDir(receivePath).filePath(
+                        QStringLiteral(".%1.%2.part").arg(context->fileName,
+                                                           QString(context->checksum.toHex().left(12))));
+                    context->finalPath = availableFinalPath(context->fileName);
+                }
+            } else {
+                const QString receivePath = storagePath();
+                QDir().mkpath(receivePath);
+                context->partialPath = QDir(receivePath).filePath(
+                    QStringLiteral(".%1.%2.part").arg(context->fileName,
+                                                       QString(context->checksum.toHex().left(12))));
+                context->finalPath = availableFinalPath(context->fileName);
             }
+            context->file = new QFile(context->partialPath, this);
+            if (!context->file->open(QIODevice::ReadWrite | QIODevice::Append)) {
+                emit taskAdded(context->id, context->peerIp, context->fileName, false, context->totalBytes);
+                emit taskUpdated(context->id, 0, QStringLiteral("write-error"), {});
+                cleanupSocket(socket, QStringLiteral("write-error"), false);
+                return;
+            }
+            if (context->file->size() > context->totalBytes)
+                context->file->resize(0);
+            context->resumeOffset = context->file->size();
+            PersistedTransfer received;
+            received.id = context->id;
+            received.peerId = context->peerId;
+            received.peerName = context->peerName;
+            received.peerIp = context->peerIp;
+            received.peerPort = context->peerPort;
+            received.isSender = false;
+            received.fileName = context->fileName;
+            received.totalBytes = context->totalBytes;
+            received.checksum = context->checksum;
+            received.partialPath = context->partialPath;
+            received.finalPath = context->finalPath;
+            received.progress = context->totalBytes
+                ? qreal(context->resumeOffset) / context->totalBytes : 0;
+            received.status = context->resumeOffset ? QStringLiteral("resuming")
+                                                    : QStringLiteral("receiving");
+            received.createdAt = saved ? saved->createdAt : QDateTime::currentMSecsSinceEpoch();
+            m_transferStore.upsert(received);
+            emit taskAdded(context->id, context->peerIp, context->fileName, false, context->totalBytes);
+            emit taskUpdated(context->id,
+                             context->totalBytes ? qreal(context->resumeOffset) / context->totalBytes : 0,
+                             context->resumeOffset ? QStringLiteral("resuming") : QStringLiteral("receiving"),
+                             context->checksum.toHex());
+            sendPacket(socket, MsgResume, [context](QDataStream &out) {
+                out << context->id << context->resumeOffset;
+            });
+        } else if (type == MsgResume) {
+            QString id;
+            qint64 offset = -1;
+            packet >> id >> offset;
+            if (packet.status() != QDataStream::Ok || !context->isSender || id != context->id
+                || offset < 0 || offset > context->totalBytes || !context->file
+                || !context->file->seek(offset)) {
+                fail(); return;
+            }
+            context->resumeOffset = offset;
+            context->offerAccepted = true;
+            m_transferRetryAttempts[context->id] = 0;
+            emit taskUpdated(context->id, context->totalBytes ? qreal(offset) / context->totalBytes : 0,
+                             offset ? QStringLiteral("resuming") : QStringLiteral("transferring"),
+                             context->checksum.toHex());
+            sendNextChunk(socket);
+        } else if (type == MsgFileData) {
+            QString id;
+            QByteArray data;
+            packet >> id >> data;
+            if (packet.status() != QDataStream::Ok || context->isSender || id != context->id
+                || !context->file || data.size() > MaxDataChunkSize
+                || context->file->pos() + data.size() > context->totalBytes) {
+                fail(); return;
+            }
+            if (context->file->write(data) != data.size()) {
+                cleanupSocket(socket, QStringLiteral("write-error"), true);
+                return;
+            }
+            const qreal progress = context->totalBytes ? qreal(context->file->pos()) / context->totalBytes : 1;
+            const int percent = int(progress * 100);
+            if (percent > context->lastProgressPct) {
+                context->lastProgressPct = percent;
+                emit taskUpdated(context->id, progress, QStringLiteral("receiving"), context->checksum.toHex());
+            }
+        } else if (type == MsgComplete) {
+            QString id;
+            bool ok = false;
+            QByteArray hash;
+            packet >> id >> ok >> hash;
+            if (packet.status() != QDataStream::Ok || id != context->id || hash.size() != 32) {
+                fail(); return;
+            }
+            if (context->isSender) {
+                emit taskUpdated(context->id, ok ? 1 : 0,
+                                 ok ? QStringLiteral("verified") : QStringLiteral("checksum-error"),
+                                 hash.toHex());
+                cleanupSocket(socket);
+                return;
+            }
+            finishReceive(socket);
+            return;
+        } else {
+            fail(); return;
         }
-        else {
-            qWarning() << "收到未知类型的消息:" << msgType;
-        }
-
-        ctx->blockSize = 0;
-        if (socket->bytesAvailable() == 0) break;
+        if (!socket->bytesAvailable())
+            return;
     }
 }
 
-// ================= 资源清理 =================
-void TransferManager::onSocketDisconnected()
+void TransferManager::finishReceive(QTcpSocket *socket)
 {
-    QTcpSocket *socket = qobject_cast<QTcpSocket*>(sender());
-    cleanupSocket(socket, "连接断开");
-}
+    auto *context = m_tasks.value(socket);
+    if (!context || !context->file)
+        return;
+    context->file->flush();
+    context->file->close();
+    emit taskUpdated(context->id,
+                     context->totalBytes ? qreal(QFileInfo(context->partialPath).size()) / context->totalBytes : 1,
+                     QStringLiteral("verifying"), context->checksum.toHex());
 
-void TransferManager::cleanupSocket(QTcpSocket *socket, const QString &finalStatus)
-{
-    if (!socket) return;
-    TransferContext *ctx = m_tasks.take(socket);
-    if (ctx) {
-        bool incomplete = false;
-        if (ctx->file) {
-            // 如果文件还没写完/读完就断开，说明失败了
-            if (ctx->file->pos() < ctx->totalBytes) {
-                incomplete = true;
-            }
-            ctx->file->close();
-            ctx->file->deleteLater();
+    const QString id = context->id;
+    const QString partial = context->partialPath;
+    const QString final = context->finalPath;
+    const QByteArray expectedHash = context->checksum;
+    const qint64 expectedSize = context->totalBytes;
+    const QPointer<QTcpSocket> guarded(socket);
+    auto *watcher = new QFutureWatcher<DigestResult>(this);
+    connect(watcher, &QFutureWatcher<DigestResult>::finished, this,
+            [this, watcher, guarded, id, partial, final, expectedHash, expectedSize] {
+        const DigestResult digest = watcher->result();
+        watcher->deleteLater();
+        if (!guarded)
+            return;
+        auto *item = m_tasks.value(guarded);
+        if (!item || item->id != id)
+            return;
+        bool ok = digest.error.isEmpty() && digest.size == expectedSize && digest.hash == expectedHash;
+        QString status = ok ? QStringLiteral("verified") : QStringLiteral("checksum-error");
+        if (ok && !QFile::rename(partial, final)) {
+            ok = false;
+            status = QStringLiteral("write-error");
+            emit transferError(tr("文件校验成功，但无法保存到：%1").arg(final));
         }
-
-        QString status = finalStatus;
-        if (incomplete && status == "连接断开") {
-            status = "传输中断";
-        }
-        if (!ctx->fileName.isEmpty()) {
-            emit taskUpdated(ctx->id, 1.0, status);
-        }
-
-
-
-        delete ctx;
-    }
-    // 断开所有关联的 Qt 信号槽，防止后续对象销毁期间触发野指针
-    socket->disconnect();
-    // 先强制断开底层 TCP 连接（如果还在连接的话）
-    socket->abort();
-
-    socket->deleteLater();
-}
-
-
-void TransferManager::openFolder()
-{
 #ifdef Q_OS_ANDROID
-    // Android 端：调用原生 Intent 打开系统文件管理器 / 下载目录
-    QJniObject context = QNativeInterface::QAndroidApplication::context();
-    if (context.isValid()) {
-        // 使用 ACTION_VIEW_DOWNLOADS，这是 Android 官方支持的跳转到“下载内容”或文件管理器的常量
-        QJniObject action = QJniObject::fromString("android.intent.action.VIEW_DOWNLOADS");
-        QJniObject intent("android/content/Intent", "(Ljava/lang/String;)V", action.object());
-
-        // 添加 FLAG_ACTIVITY_NEW_TASK 标志 (0x10000000)，否则在某些系统上无法从后台拉起独立应用
-        intent.callMethod<QJniObject>("addFlags", "(I)Landroid/content/Intent;", 0x10000000);
-
-        // 启动 Activity
-        context.callMethod<void>("startActivity", "(Landroid/content/Intent;)V", intent.object());
-    }
-#else
-    // Windows / Mac / Linux 桌面端：直接调用资源管理器打开指定目录
-    QDesktopServices::openUrl(QUrl::fromLocalFile(m_saveDirectory));
+        const QString destination = m_saveDirectory;
+        if (ok && QUrl(destination).scheme() == QStringLiteral("content")) {
+            const QString fileName = QFileInfo(final).fileName();
+            auto *copyWatcher = new QFutureWatcher<bool>(this);
+            connect(copyWatcher, &QFutureWatcher<bool>::finished, this,
+                    [this, copyWatcher, guarded, id, final, digest] {
+                const bool copied = copyWatcher->result();
+                copyWatcher->deleteLater();
+                if (!guarded) return;
+                auto *active = m_tasks.value(guarded);
+                if (!active || active->id != id) return;
+                if (copied) QFile::remove(final);
+                else emit transferError(tr("文件校验成功，但无法写入所选接收目录"));
+                emit taskUpdated(id, copied ? 1 : 0,
+                                 copied ? QStringLiteral("verified") : QStringLiteral("write-error"),
+                                 digest.hash.toHex());
+                active->completionSent = true;
+                sendPacket(guarded, MsgComplete, [id, copied, digest](QDataStream &out) {
+                    out << id << copied << digest.hash;
+                });
+                guarded->flush();
+                guarded->disconnectFromHost();
+            });
+            copyWatcher->setFuture(QtConcurrent::run(
+                [destination, final, fileName] {
+                    return copyToAndroidDirectory(destination, final, fileName);
+                }));
+            return;
+        }
 #endif
+        const qreal progress = ok ? 1 : qreal(qMax<qint64>(0, digest.size)) / qMax<qint64>(1, expectedSize);
+        emit taskUpdated(id, progress, status, digest.hash.toHex());
+        item->completionSent = true;
+        sendPacket(guarded, MsgComplete, [id, ok, digest](QDataStream &out) {
+            out << id << ok << digest.hash;
+        });
+        guarded->flush();
+        guarded->disconnectFromHost();
+    });
+    watcher->setFuture(QtConcurrent::run(calculateDigest, partial));
 }
 
 void TransferManager::sendText(const QString &text, const QString &ip, quint16 port)
 {
-    QTcpSocket *socket = new QTcpSocket(this);
-    TransferContext *ctx = new TransferContext();
-    ctx->id = QUuid::createUuid().toString();
-    ctx->isSender = true;
-    // 注意：文本传输不需要绑定 file，也不触发 taskAdded (文件列表里不显示它)
-    m_tasks[socket] = ctx;
-
-    connect(socket, &QTcpSocket::connected, this, [socket, text]() {
-        QByteArray block;
-        QDataStream out(&block, QIODevice::WriteOnly);
-        out.setVersion(QDataStream::Qt_6_5);
-        // 打包：大小(占位) + 类型(MsgText) + 文本内容
-        out << (quint32)0 << (quint8)MsgText << text;
-        out.device()->seek(0);
-        out << (quint32)(block.size() - sizeof(quint32));
-        socket->write(block);
-    });
-
-    // 写入完毕后主动断开
-    connect(socket, &QTcpSocket::bytesWritten, this, [socket](qint64) {
-        if (socket->bytesToWrite() == 0) {
-            socket->disconnectFromHost();
+    if (text.trimmed().isEmpty() || text.size() > MaxTextLength || ip.isEmpty() || port == 0)
+        return;
+    for (auto it = m_sessions.cbegin(); it != m_sessions.cend(); ++it) {
+        auto *socket = it.value().data();
+        auto *context = socket ? m_tasks.value(socket) : nullptr;
+        if (context && context->paired && context->peerIp == ip) {
+            sendPacket(socket, MsgText, [text](QDataStream &out) { out << text; });
+            return;
         }
-    });
-
-    connect(socket, &QTcpSocket::disconnected, this, &TransferManager::onSocketDisconnected);
-    connect(socket, &QTcpSocket::errorOccurred, this, [this, socket](QAbstractSocket::SocketError) {
-        cleanupSocket(socket);
-    });
-
-    socket->connectToHost(ip, port);
+    }
+    emit transferError(tr("请先与该设备配对"));
 }
 
+QString TransferManager::availableFinalPath(const QString &name) const
+{
+    const QString receivePath = storagePath();
+    QString path = QDir(receivePath).filePath(name);
+    const QFileInfo info(path);
+    int number = 1;
+    while (QFileInfo::exists(path)) {
+        path = QDir(receivePath).filePath(info.suffix().isEmpty()
+            ? QStringLiteral("%1 (%2)").arg(info.completeBaseName()).arg(number++)
+            : QStringLiteral("%1 (%2).%3").arg(info.completeBaseName()).arg(number++).arg(info.suffix()));
+    }
+    return path;
+}
 
+QString TransferManager::storagePath() const
+{
+#ifdef Q_OS_ANDROID
+    if (QUrl(m_saveDirectory).scheme() == QStringLiteral("content")) {
+        const QString staging = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
+                                    .filePath(QStringLiteral("Received"));
+        QDir().mkpath(staging);
+        return staging;
+    }
+#endif
+    return m_saveDirectory;
+}
+
+bool TransferManager::establishSession(QTcpSocket *socket, TransferContext *context)
+{
+    if (!socket || !context || context->peerId.isEmpty()) return false;
+    auto *previous = m_sessions.value(context->peerId).data();
+    auto *previousContext = previous ? m_tasks.value(previous) : nullptr;
+    const bool preferOutgoing = m_localId < context->peerId;
+    const bool newPreferred = context->isSender == preferOutgoing;
+    const bool previousPreferred = previousContext
+        && previousContext->isSender == preferOutgoing;
+    if (previous && previous != socket && previousContext
+        && previous->state() == QAbstractSocket::ConnectedState
+        && (!newPreferred || previousPreferred)) {
+        context->paired = true;
+        context->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+        qInfo() << "Ignoring duplicate control session for" << context->peerId
+                << "direction" << (context->isSender ? "outgoing" : "incoming")
+                << "preferred direction" << (preferOutgoing ? "outgoing" : "incoming");
+        return false;
+    }
+    m_sessions[context->peerId] = socket;
+    context->paired = true;
+    context->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+    saveTrustedPeer(context->peerId, context->peerName, context->peerIp, context->peerPort);
+    auto &peer = m_connections[context->peerId];
+    peer.reconnectAttempt = 0;
+    ++peer.reconnectGeneration;
+    setConnectionState(context->peerId, ConnectionState::Online);
+    qInfo() << "Adopted control session for" << context->peerId
+            << "direction" << (context->isSender ? "outgoing" : "incoming")
+            << "preferred" << newPreferred;
+    if (previous && previous != socket) cleanupSocket(previous);
+    return true;
+}
+
+void TransferManager::scheduleReconnect(const QString &peerId)
+{
+    if (!isTrusted(peerId) || peerId.isEmpty()) return;
+    auto &peer = m_connections[peerId];
+    if (peer.ip.isEmpty() || peer.port == 0 || peer.reconnectAttempt >= MaxReconnectAttempts) {
+        setConnectionState(peerId, ConnectionState::Offline);
+        return;
+    }
+    setConnectionState(peerId, ConnectionState::Reconnecting);
+    const int attempt = ++peer.reconnectAttempt;
+    const quint64 generation = ++peer.reconnectGeneration;
+    const int delayMs = qMin(30000, 1000 * (1 << qMin(attempt - 1, 5)));
+    QTimer::singleShot(delayMs, this, [this, peerId, generation] {
+        auto it = m_connections.find(peerId);
+        if (it == m_connections.end() || it->reconnectGeneration != generation
+            || it->state != ConnectionState::Reconnecting || isPaired(peerId)) return;
+        const PeerConnection peer = *it;
+        openControlConnection(peerId, peer.name, peer.ip, peer.port, true);
+    });
+}
+
+void TransferManager::cleanupSocket(QTcpSocket *socket, const QString &status, bool preservePartial)
+{
+    if (!socket) return;
+    auto *context = m_tasks.take(socket);
+    if (context) {
+        const QString peerId = context->peerId;
+        const bool wasPaired = context->paired;
+        qreal progress = 0;
+        if (context->file && context->totalBytes)
+            progress = qreal(context->file->pos()) / context->totalBytes;
+        if (context->file) {
+            context->file->close();
+            if (!preservePartial && !context->partialPath.isEmpty())
+                QFile::remove(context->partialPath);
+            context->file->deleteLater();
+        }
+        if (!status.isEmpty() && !context->id.isEmpty())
+            emit taskUpdated(context->id, progress, status, context->checksum.toHex());
+        if (!context->isControl && context->isSender && !context->id.isEmpty()) {
+            m_activeTransferIds.remove(context->id);
+            if (status == QStringLiteral("paused")) {
+                const auto transfer = m_transferStore.find(context->id);
+                if (transfer) {
+                    enqueueOutgoing(*transfer, false);
+                    const int attempt = ++m_transferRetryAttempts[context->id];
+                    if (attempt <= MaxReconnectAttempts && isPaired(transfer->peerId)) {
+                        const QString transferId = context->id;
+                        const int delayMs = qMin(30000, 1000 * (1 << qMin(attempt - 1, 5)));
+                        QTimer::singleShot(delayMs, this, [this, transferId] {
+                            auto it = m_pendingOutgoing.find(transferId);
+                            if (it == m_pendingOutgoing.end() || !isPaired(it->transfer.peerId)) return;
+                            const PendingOutgoing pending = *it;
+                            m_pendingOutgoing.erase(it);
+                            beginOutgoingTransfer(pending.transfer, pending.validateSource);
+                        });
+                    }
+                }
+            }
+            else m_transferRetryAttempts.remove(context->id);
+        }
+        if (!peerId.isEmpty()) {
+            const bool currentSession = m_sessions.value(peerId) == socket;
+            if (currentSession) m_sessions.remove(peerId);
+            if (currentSession && wasPaired)
+                scheduleReconnect(peerId);
+            else if (!wasPaired && m_connections.value(peerId).state == ConnectionState::Pairing)
+                setConnectionState(peerId, ConnectionState::Unpaired);
+            else if (!wasPaired && m_connections.value(peerId).state == ConnectionState::Reconnecting)
+                scheduleReconnect(peerId);
+        }
+        delete context;
+    }
+    socket->disconnect(this);
+    socket->abort();
+    socket->deleteLater();
+}
+
+void TransferManager::cancelTransfer(const QString &id)
+{
+    for (auto it = m_tasks.begin(); it != m_tasks.end(); ++it) {
+        if (it.value()->id == id) {
+            cleanupSocket(it.key(), QStringLiteral("cancelled"), false);
+            return;
+        }
+    }
+    if (m_pendingOutgoing.remove(id) > 0) {
+        m_transferRetryAttempts.remove(id);
+        emit taskUpdated(id, 0, QStringLiteral("cancelled"), {});
+        return;
+    }
+    const auto transfer = m_transferStore.find(id);
+    if (transfer) {
+        if (transfer->isSender) {
+            m_cancelledTransferIds.insert(id);
+            m_activeTransferIds.remove(id);
+        } else if (!transfer->partialPath.isEmpty()) {
+            QFile::remove(transfer->partialPath);
+        }
+        emit taskUpdated(id, transfer->progress, QStringLiteral("cancelled"),
+                         transfer->checksum.toHex());
+    }
+}
+
+void TransferManager::openFolder()
+{
+#ifdef Q_OS_ANDROID
+    const auto context = QNativeInterface::QAndroidApplication::context();
+    if (context.isValid() && QUrl(m_saveDirectory).scheme() == QStringLiteral("content")) {
+        const QJniObject directory = QJniObject::fromString(m_saveDirectory);
+        QJniObject::callStaticMethod<void>("org/landrop/app/StorageBridge", "openDirectory",
+                                           "(Landroid/content/Context;Ljava/lang/String;)V",
+                                           context.object(), directory.object());
+    } else if (context.isValid()) {
+        QJniObject::callStaticMethod<void>("org/landrop/app/LanTransferService", "openDownloads",
+                                           "(Landroid/content/Context;)V", context.object());
+    }
+#else
+    QDesktopServices::openUrl(QUrl::fromLocalFile(m_saveDirectory));
+#endif
+}

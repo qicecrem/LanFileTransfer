@@ -17,6 +17,97 @@ repositories {
 
 apply plugin: qtGradlePluginType
 
+// Qt 6.8.3 declares QtScreenCaptureService package-private although Android
+// must instantiate manifest services through reflection. Patch only the
+// class access flags in the deployed Qt JAR, leaving Qt's implementation and
+// hard-coded service name intact.
+def patchClassPublic = { byte[] bytes ->
+    def u2 = { int at -> ((bytes[at] & 0xff) << 8) | (bytes[at + 1] & 0xff) }
+    def u4 = { int at -> ((bytes[at] & 0xff) << 24) | ((bytes[at + 1] & 0xff) << 16) |
+            ((bytes[at + 2] & 0xff) << 8) | (bytes[at + 3] & 0xff) }
+    int constantPoolCount = u2(8)
+    int offset = 10
+    def utf8 = [:]
+    for (int index = 1; index < constantPoolCount; index++) {
+        int tag = bytes[offset++] & 0xff
+        switch (tag) {
+            case 1:
+                int length = u2(offset)
+                utf8[index] = new String(bytes, offset + 2, length, 'UTF-8')
+                offset += 2 + length
+                break
+            case 3: case 4: case 9: case 10: case 11: case 12:
+            case 17: case 18: offset += 4; break
+            case 5: case 6: offset += 8; index++; break
+            case 7: case 8: case 16: case 19: case 20: offset += 2; break
+            case 15: offset += 3; break
+            default: throw new GradleException("Unknown Java class constant-pool tag: " + tag)
+        }
+    }
+    int flags = u2(offset)
+    flags = (flags | 0x0001) & ~0x0006
+    bytes[offset] = (byte)((flags >> 8) & 0xff)
+    bytes[offset + 1] = (byte)(flags & 0xff)
+
+    // Android also requires a public zero-argument constructor.
+    int cursor = offset + 8 + 2 * u2(offset + 6)
+    int fieldCount = u2(cursor)
+    cursor += 2
+    for (int field = 0; field < fieldCount; field++) {
+        int attributeCount = u2(cursor + 6)
+        cursor += 8
+        for (int attribute = 0; attribute < attributeCount; attribute++)
+            cursor += 6 + u4(cursor + 2)
+    }
+    int methodCount = u2(cursor)
+    cursor += 2
+    for (int method = 0; method < methodCount; method++) {
+        int methodOffset = cursor
+        int nameIndex = u2(cursor + 2)
+        int attributeCount = u2(cursor + 6)
+        if (utf8[nameIndex] == '<init>') {
+            int methodFlags = (u2(methodOffset) | 0x0001) & ~0x0006
+            bytes[methodOffset] = (byte)((methodFlags >> 8) & 0xff)
+            bytes[methodOffset + 1] = (byte)(methodFlags & 0xff)
+        }
+        cursor += 8
+        for (int attribute = 0; attribute < attributeCount; attribute++)
+            cursor += 6 + u4(cursor + 2)
+    }
+    return bytes
+}
+
+tasks.register('patchQtScreenCaptureService') {
+    doLast {
+        def jarPath = file('libs/Qt6AndroidMultimedia.jar')
+        if (!jarPath.exists())
+            throw new GradleException('Qt6AndroidMultimedia.jar is missing')
+        def tempPath = file("${buildDir}/patched/Qt6AndroidMultimedia.jar")
+        tempPath.parentFile.mkdirs()
+        def input = new java.util.zip.ZipFile(jarPath)
+        def output = new java.util.zip.ZipOutputStream(new FileOutputStream(tempPath))
+        try {
+            input.entries().each { entry ->
+                def copy = new java.util.zip.ZipEntry(entry.name)
+                copy.time = entry.time
+                output.putNextEntry(copy)
+                byte[] data = input.getInputStream(entry).bytes
+                if (entry.name == 'org/qtproject/qt/android/multimedia/QtScreenCaptureService.class')
+                    data = patchClassPublic(data)
+                output.write(data)
+                output.closeEntry()
+            }
+        } finally {
+            output.close()
+            input.close()
+        }
+        java.nio.file.Files.move(tempPath.toPath(), jarPath.toPath(),
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+    }
+}
+
+tasks.named('preBuild').configure { dependsOn 'patchQtScreenCaptureService' }
+
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar', '*.aar'])
     //noinspection GradleDependency

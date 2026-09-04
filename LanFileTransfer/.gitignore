@@ -1,0 +1,44 @@
+# CMake and Qt build output
+/build/
+/build-*/
+/out/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Testing/
+/.qt/
+
+# Qt Creator and editor-local settings
+/.qtcreator/
+*.user
+*.user.*
+*.autosave
+/.vscode/
+/.idea/
+
+# Local design-review working state
+/design-qa.md
+/figma-design-state.json
+
+# Generated Android deployment content
+/android/.gradle/
+/android/build/
+/android/libs/
+/android/assets/
+/android/jniLibs/
+/android/local.properties
+
+# Platform noise and temporary files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
+*.log
+*.dmp
+
+# Release credentials must never enter source control
+*.keystore
+*.jks
+keystore.properties

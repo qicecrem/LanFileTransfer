@@ -11,6 +11,7 @@ cmake_minimum_required(VERSION 3.16)
 # 版本：0.1（可通过 project(… VERSION) 自动生成版本宏）
 # 使用语言：仅 C++（LANGUAGES CXX 可减少不必要的语言检测，加快配置）
 project(LanFileTransfer VERSION 0.1 LANGUAGES CXX)
+include(CTest)
 
 # ============================================================================
 # C++ 标准配置
@@ -39,7 +40,7 @@ set(CMAKE_AUTOUIC ON)
 # Qml      - QML 引擎与运行时
 # Quick    - Qt Quick 模块（标准 QML 类型和控件）
 # Network  - 网络功能（TCP/UDP、HTTP、本地发现等）
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick Network)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick Network Sql Widgets Multimedia Concurrent)
 
 # ============================================================================
 # 创建可执行文件并嵌入资源
@@ -73,13 +74,15 @@ qt_add_qml_module(appLanFileTransfer
     # 属于该模块的 QML 文件列表（自动加入资源）
     QML_FILES
         Main.qml
-        DesktopLayout.qml
-        MobileLayout.qml
     # 属于该模块的 C++ 源文件和头文件
     # 这些文件中定义的 QObject 派生类会自动注册到 QML 类型系统
     SOURCES
         transfermanager.h transfermanager.cpp
+        transferstore.h transferstore.cpp
         discoveryservice.h discoveryservice.cpp
+        appcontroller.h appcontroller.cpp
+        callmanager.h callmanager.cpp
+        diagnosticlog.h diagnosticlog.cpp
 
 )
 
@@ -96,6 +99,10 @@ target_link_libraries(appLanFileTransfer
         Qt6::Qml
         Qt6::Quick
         Qt6::Network
+        Qt6::Sql
+        Qt6::Widgets
+        Qt6::Multimedia
+        Qt6::Concurrent
 )
 
 # ============================================================================
@@ -105,6 +112,7 @@ target_link_libraries(appLanFileTransfer
 # WIN32_EXECUTABLE 属性会使链接器选择 /SUBSYSTEM:WINDOWS 而不是 /SUBSYSTEM:CONSOLE。
 if(WIN32)
     set_target_properties(appLanFileTransfer PROPERTIES WIN32_EXECUTABLE TRUE)
+    target_link_libraries(appLanFileTransfer PRIVATE dbghelp)
 endif()
 
 # ============================================================================
@@ -114,8 +122,30 @@ if(ANDROID)
     # 指定 Android 部署包源目录，该目录下应包含 AndroidManifest.xml、build.gradle 等文件
     # Qt 的 androiddeployqt 工具会使用此目录生成最终 APK
     set_property(TARGET appLanFileTransfer PROPERTY QT_ANDROID_PACKAGE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/android")
+    set_property(TARGET appLanFileTransfer PROPERTY QT_ANDROID_PACKAGE_NAME "org.landrop.app")
 
     # 强制指定目标 ABI 为 arm64-v8a（适用于现代 64 位 ARM 设备，如骁龙 8 Gen 1）
     # 注意：该变量可能在 Android 工具链中被重新设置，更可靠的方式是使用 CMAKE_ANDROID_ARCH_ABI
     # 但此处保留以明确意图
+endif()
+
+if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(transferstore_test
+        tests/transferstore_test.cpp
+        transferstore.h transferstore.cpp
+    )
+    target_include_directories(transferstore_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(transferstore_test PRIVATE Qt6::Core Qt6::Sql)
+    add_test(NAME transferstore_test COMMAND transferstore_test)
+
+    add_executable(diagnosticlog_test
+        tests/diagnosticlog_test.cpp
+        diagnosticlog.h diagnosticlog.cpp
+    )
+    target_include_directories(diagnosticlog_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(diagnosticlog_test PRIVATE Qt6::Core)
+    if(WIN32)
+        target_link_libraries(diagnosticlog_test PRIVATE dbghelp)
+    endif()
+    add_test(NAME diagnosticlog_test COMMAND diagnosticlog_test)
 endif()

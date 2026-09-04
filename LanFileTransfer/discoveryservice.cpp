@@ -6,10 +6,13 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QRandomGenerator>
+#include <QSettings>
+#include <utility>
 
 #ifdef Q_OS_ANDROID
 #include <QJniObject>
 #include <QCoreApplication>
+#include <QtCore/qcoreapplication_platform.h>
 #endif
 
 #ifdef Q_OS_WIN
@@ -25,7 +28,12 @@ const quint16 DISCOVERY_PORT = 45454;   ///< UDP 广播端口，需与所有设�
 DiscoveryService::DiscoveryService(QObject *parent)
     : QObject{parent}
 {
-    m_instanceId = QUuid::createUuid().toString();
+    QSettings settings("Lantern Labs", "LanDrop");
+    m_instanceId = settings.value("identity/instanceId").toString();
+    if (m_instanceId.isEmpty()) {
+        m_instanceId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        settings.setValue("identity/instanceId", m_instanceId);
+    }
 
 
     int randomId = QRandomGenerator::global()->bounded(1000, 10000);
@@ -40,38 +48,9 @@ DiscoveryService::DiscoveryService(QObject *parent)
     m_timer = new QTimer(this);
 
     // 1. 绑定端口，必须使用 IPv4
-    m_udpSocket->bind(QHostAddress::AnyIPv4, DISCOVERY_PORT,
-                      QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint);
-
-    QHostAddress multicastAddress("239.255.43.21");
-
-    // 2. 【核心修复】：遍历所有网卡，让所有处于活跃状态的网卡都加入组播！
-    QList<QNetworkInterface> interfaces = QNetworkInterface::allInterfaces();
-    for (const QNetworkInterface &iface : interfaces) {
-        // 只筛选出：正在运行的 (IsUp)、非本机环回的 (!IsLoopBack)、且支持组播的 (CanMulticast) 网卡
-        if ((iface.flags() & QNetworkInterface::IsUp) &&
-            !(iface.flags() & QNetworkInterface::IsLoopBack) &&
-            (iface.flags() & QNetworkInterface::CanMulticast)) {
-
-            // 确保网卡有 IPv4 地址
-            bool hasIPv4 = false;
-            for (const QNetworkAddressEntry &entry : iface.addressEntries()) {
-                if (entry.ip().protocol() == QAbstractSocket::IPv4Protocol) {
-                    hasIPv4 = true;
-                    break;
-                }
-            }
-
-            if (hasIPv4) {
-                // 针对该特定网卡加入组播组
-                if (!m_udpSocket->joinMulticastGroup(multicastAddress, iface)) {
-                    qWarning() << "网卡 [" << iface.humanReadableName() << "] 加入组播失败:" << m_udpSocket->errorString();
-                } else {
-                    qDebug() << "网卡 [" << iface.humanReadableName() << "] 成功加入组播";
-                }
-            }
-        }
-    }
+    if (!m_udpSocket->bind(QHostAddress::AnyIPv4, DISCOVERY_PORT,
+                           QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint))
+        qWarning() << "UDP discovery bind failed:" << m_udpSocket->errorString();
 
     // 允许组播数据回环（允许自己发出的组播也能被本机的其他程序收到，便于本机多开调试）
     m_udpSocket->setSocketOption(QAbstractSocket::MulticastLoopbackOption, 1);
@@ -80,6 +59,36 @@ DiscoveryService::DiscoveryService(QObject *parent)
 
     connect(m_udpSocket, &QUdpSocket::readyRead, this, &DiscoveryService::processPendingDatagrams);
     connect(m_timer, &QTimer::timeout, this, &DiscoveryService::broadcastHeartbeat);
+}
+
+void DiscoveryService::joinMulticastInterfaces()
+{
+    if (!m_joinedInterfaces.isEmpty()) return;
+    const QHostAddress multicastAddress(QStringLiteral("239.255.43.21"));
+    for (const QNetworkInterface &iface : QNetworkInterface::allInterfaces()) {
+        const auto flags = iface.flags();
+        if (!(flags & QNetworkInterface::IsUp) || (flags & QNetworkInterface::IsLoopBack)
+            || !(flags & QNetworkInterface::CanMulticast)) continue;
+        bool hasIPv4 = false;
+        for (const QNetworkAddressEntry &entry : iface.addressEntries()) {
+            if (entry.ip().protocol() == QAbstractSocket::IPv4Protocol) { hasIPv4 = true; break; }
+        }
+        if (!hasIPv4) continue;
+        if (m_udpSocket->joinMulticastGroup(multicastAddress, iface))
+            m_joinedInterfaces.append(iface);
+        else
+            qWarning() << "Multicast join failed on" << iface.humanReadableName()
+                       << m_udpSocket->errorString();
+    }
+}
+
+void DiscoveryService::leaveMulticastInterfaces()
+{
+    const QHostAddress multicastAddress(QStringLiteral("239.255.43.21"));
+    for (const QNetworkInterface &iface : std::as_const(m_joinedInterfaces))
+        m_udpSocket->leaveMulticastGroup(multicastAddress, iface);
+    m_joinedInterfaces.clear();
+    m_udpSocket->setMulticastInterface(QNetworkInterface());
 }
 
 
@@ -146,24 +155,43 @@ void DiscoveryService::startScan()
     }
 #endif
 
+    // Android 必须先持有 MulticastLock，再加入组播组。
+    joinMulticastInterfaces();
+
     // 立即发送一次广播，快速发现设备
     broadcastHeartbeat();
     // 启动定时器，每 3 秒发送一次心跳
     m_timer->start(3000);
 }
 
-void DiscoveryService::stopScan()
+void DiscoveryService::refreshNetwork()
 {
     if (!m_timer->isActive()) {
-        qDebug() << "扫描未运行，stopScan 无操作";
+        startScan();
         return;
     }
+    qInfo() << "Network environment changed; rebinding discovery interfaces";
+    leaveMulticastInterfaces();
+    m_lastSeen.clear();
+    m_peers.clear();
+    if (!m_deviceList.isEmpty()) {
+        m_deviceList.clear();
+        emit deviceListChanged();
+    }
+    joinMulticastInterfaces();
+    broadcastHeartbeat();
+}
 
-    m_timer->stop();
+void DiscoveryService::stopScan()
+{
+    if (m_timer->isActive()) m_timer->stop();
     qDebug() << "停止 UDP 扫描，清空设备列表";
+
+    leaveMulticastInterfaces();
 
     // 清空所有设备记录
     m_lastSeen.clear();
+    m_peers.clear();
     m_deviceList.clear();
     emit deviceListChanged();
 
@@ -185,19 +213,22 @@ void DiscoveryService::broadcastHeartbeat()
     json["name"] = m_deviceName;
     json["uid"] = m_instanceId;
     json["tcpPort"] = m_localTcpPort;
+    json["mediaPort"] = m_localMediaPort;
 
     QJsonDocument doc(json);
     QByteArray datagram = doc.toJson(QJsonDocument::Compact);
 
     QHostAddress multicastAddress("239.255.43.21");
 
-    // 【核心修复】：将组播包通过系统的默认路由发出去
-    // 为了防止部分系统路由错误，这里直接发出去，通常上一步的多网卡 join 已经解决了 90% 的问题
-    qint64 bytesSent = m_udpSocket->writeDatagram(datagram, multicastAddress, DISCOVERY_PORT);
-
-    if (bytesSent == -1) {
-        qWarning() << "发送 UDP 组播失败:" << m_udpSocket->errorString();
+    bool sent = false;
+    for (const QNetworkInterface &iface : std::as_const(m_joinedInterfaces)) {
+        m_udpSocket->setMulticastInterface(iface);
+        if (m_udpSocket->writeDatagram(datagram, multicastAddress, DISCOVERY_PORT) >= 0) sent = true;
     }
+    if (m_joinedInterfaces.isEmpty())
+        sent = m_udpSocket->writeDatagram(datagram, multicastAddress, DISCOVERY_PORT) >= 0;
+    m_udpSocket->setMulticastInterface(QNetworkInterface());
+    if (!sent) qWarning() << "发送 UDP 组播失败:" << m_udpSocket->errorString();
 
     refreshDeviceList();
 }
@@ -206,7 +237,9 @@ void DiscoveryService::processPendingDatagrams()
 {
     while (m_udpSocket->hasPendingDatagrams()) {
         QByteArray datagram;
-        datagram.resize(m_udpSocket->pendingDatagramSize());
+        const qint64 pendingSize = m_udpSocket->pendingDatagramSize();
+        if (pendingSize <= 0 || pendingSize > 4096) { m_udpSocket->readDatagram(nullptr, 0); continue; }
+        datagram.resize(pendingSize);
         QHostAddress senderIp;
         quint16 senderPort;  // 虽然不需要，但 readDatagram 可以接收
 
@@ -233,13 +266,15 @@ void DiscoveryService::processPendingDatagrams()
         QJsonObject obj = doc.object();
         QString uid = obj["uid"].toString();
         // 忽略自己发出的广播
-        if (uid == m_instanceId) {
+        if (uid.isEmpty() || uid == m_instanceId) {
             continue;
         }
 
         QString deviceName = obj["name"].toString();
         int tcpPort = obj["tcpPort"].toInt();
-        if (deviceName.isEmpty() || tcpPort == 0) {
+        const int mediaPort = obj["mediaPort"].toInt();
+        if (deviceName.isEmpty() || deviceName.size() > 80 || tcpPort < 1 || tcpPort > 65535
+            || mediaPort < 0 || mediaPort > 65535) {
             qDebug() << "收到不完整的设备信息（缺少 name 或 tcpPort）";
             continue;
         }
@@ -250,10 +285,14 @@ void DiscoveryService::processPendingDatagrams()
         }
         QString ipStr = senderIp.toString();
 
-        // 使用 UUID + IP + Name + Port 作为唯一键，防止同 IP 多设备互相覆盖
-        // 格式: UUID|IP|Name|Port
-        QString key = QString("%1|%2|%3|%4").arg(uid, ipStr, deviceName).arg(tcpPort);
-        m_lastSeen[key] = QDateTime::currentMSecsSinceEpoch();
+        QVariantMap device;
+        device["id"] = uid;
+        device["ip"] = ipStr;
+        device["name"] = deviceName;
+        device["port"] = tcpPort;
+        device["mediaPort"] = mediaPort;
+        m_peers[uid] = device;
+        m_lastSeen[uid] = QDateTime::currentMSecsSinceEpoch();
 
         // 实时刷新设备列表（可选，也可依赖定时刷新，但此处立即刷新可更快响应）
         refreshDeviceList();
@@ -270,15 +309,9 @@ void DiscoveryService::refreshDeviceList()
     while (it.hasNext()) {
         it.next();
         if (now - it.value() < TIMEOUT_MS) {
-            QStringList parts = it.key().split('|');
-            if (parts.size() == 4) {
-                QVariantMap device;
-                device["ip"]   = parts[1];
-                device["name"] = parts[2];
-                device["port"] = parts[3].toInt();
-                newList.append(device);
-            }
+            if (m_peers.contains(it.key())) newList.append(m_peers.value(it.key()));
         } else {
+            m_peers.remove(it.key());
             it.remove();
         }
     }

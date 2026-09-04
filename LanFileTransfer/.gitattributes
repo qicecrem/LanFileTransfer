@@ -1,0 +1,30 @@
+* text=auto
+
+# Keep source and project metadata stable across Windows and CI hosts.
+*.cpp text eol=lf
+*.h text eol=lf
+*.qml text eol=lf
+*.java text eol=lf
+*.gradle text eol=lf
+*.properties text eol=lf
+*.xml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+CMakeLists.txt text eol=lf
+
+# Windows command scripts should remain directly executable in Windows tools.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.svg text eol=lf
+*.otf binary
+*.jar binary
+*.keystore binary
+*.jks binary

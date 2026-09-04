@@ -16,6 +16,7 @@
 #include <QVariantList>
 #include <QMap>
 #include <QUuid>
+#include <QNetworkInterface>
 
 #ifdef Q_OS_ANDROID
 #include <QJniObject>
@@ -84,6 +85,7 @@ public:
      * 以便它们建立 TCP 连接进行文件传输。
      */
     Q_INVOKABLE void setLocalTcpPort(quint16 port) { m_localTcpPort = port; }
+    Q_INVOKABLE void setLocalMediaPort(quint16 port) { m_localMediaPort = port; }
 
     /**
      * @brief 开始扫描局域网设备
@@ -94,6 +96,7 @@ public:
      * 如果已经处于扫描状态，则重复调用无效。
      */
     Q_INVOKABLE void startScan();
+    Q_INVOKABLE void refreshNetwork();
 
     /**
      * @brief 停止扫描并清空设备列表
@@ -141,10 +144,13 @@ private:
     QTimer *m_timer;           ///< 定时器，控制心跳发送频率（3 秒一次）
 
     QVariantList m_deviceList;      ///< 当前在线设备列表（用于暴露给 QML）
-    QMap<QString, qint64> m_lastSeen; ///< 记录每个设备唯一标识键的最后一次心跳时间戳（毫秒）
+    QMap<QString, qint64> m_lastSeen;
+    QMap<QString, QVariantMap> m_peers;
+    QList<QNetworkInterface> m_joinedInterfaces;
 
     QString m_instanceId;           ///< 本机唯一标识符（UUID），用于区分不同设备
     quint16 m_localTcpPort = 0;     ///< 本机文件传输服务的 TCP 端口号
+    quint16 m_localMediaPort = 0;   ///< 视频与屏幕共享服务端口
      QString m_deviceName;
 
 #ifdef Q_OS_ANDROID
@@ -158,6 +164,8 @@ private:
      * 如果列表有变化则发射 deviceListChanged() 信号。
      */
     void refreshDeviceList();
+    void joinMulticastInterfaces();
+    void leaveMulticastInterfaces();
 };
 
 #endif // DISCOVERYSERVICE_H
