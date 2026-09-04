@@ -15,6 +15,7 @@
 #include <QTimer>
 #include <QUuid>
 #include <QtConcurrent/QtConcurrentRun>
+#include <algorithm>
 #include <utility>
 
 #ifdef Q_OS_ANDROID
@@ -166,6 +167,35 @@ QString TransferManager::connectionState(const QString &peerId) const
     return stateName(m_connections.value(peerId).state);
 }
 
+QVariantList TransferManager::trustedPeers() const
+{
+    QStringList peerIds;
+    for (auto it = m_connections.cbegin(); it != m_connections.cend(); ++it)
+        if (it->trusted) peerIds.append(it.key());
+    std::sort(peerIds.begin(), peerIds.end(), [this](const QString &left, const QString &right) {
+        const int byName = QString::compare(m_connections.value(left).name,
+                                            m_connections.value(right).name,
+                                            Qt::CaseInsensitive);
+        return byName == 0 ? left < right : byName < 0;
+    });
+
+    QVariantList result;
+    result.reserve(peerIds.size());
+    for (const QString &peerId : std::as_const(peerIds)) {
+        const PeerConnection &peer = m_connections[peerId];
+        result.append(QVariantMap{
+            {QStringLiteral("id"), peerId},
+            {QStringLiteral("name"), peer.name},
+            {QStringLiteral("ip"), peer.ip},
+            {QStringLiteral("port"), peer.port},
+            {QStringLiteral("state"), stateName(peer.state)},
+            {QStringLiteral("online"), peer.state == ConnectionState::Online},
+            {QStringLiteral("lastSeen"), peer.lastSeen}
+        });
+    }
+    return result;
+}
+
 void TransferManager::setConnectionState(const QString &peerId, ConnectionState state)
 {
     if (peerId.isEmpty()) return;
@@ -175,6 +205,7 @@ void TransferManager::setConnectionState(const QString &peerId, ConnectionState 
     qInfo() << "Peer connection state" << peerId << stateName(state);
     emit pairingStateChanged(peerId, stateName(state));
     emit peerAuthorizationChanged(peerId, peer.ip, state == ConnectionState::Online);
+    if (peer.trusted) emit trustedPeersChanged();
     if (state == ConnectionState::Online) {
         for (auto it = m_pendingOutgoing.cbegin(); it != m_pendingOutgoing.cend(); ++it)
             if (it->transfer.peerId == peerId) m_transferRetryAttempts[it.key()] = 0;
@@ -192,6 +223,7 @@ void TransferManager::loadTrustedPeers()
         peer.name = settings.value(QStringLiteral("name")).toString();
         peer.ip = settings.value(QStringLiteral("ip")).toString();
         peer.port = quint16(settings.value(QStringLiteral("port")).toUInt());
+        peer.lastSeen = settings.value(QStringLiteral("lastSeen")).toLongLong();
         peer.trusted = true;
         peer.state = ConnectionState::Offline;
         m_connections.insert(peerId, peer);
@@ -213,14 +245,18 @@ void TransferManager::saveTrustedPeer(const QString &peerId, const QString &name
     peer.name = name;
     peer.ip = ip;
     if (port) peer.port = port;
+    peer.lastSeen = QDateTime::currentMSecsSinceEpoch();
     QSettings settings(m_settingsOrganization, m_settingsApplication);
     settings.beginGroup(QStringLiteral("trustedPeers"));
     settings.beginGroup(peerId);
     settings.setValue(QStringLiteral("name"), peer.name);
     settings.setValue(QStringLiteral("ip"), peer.ip);
     settings.setValue(QStringLiteral("port"), peer.port);
+    settings.setValue(QStringLiteral("lastSeen"), peer.lastSeen);
     settings.endGroup();
     settings.endGroup();
+    settings.sync();
+    emit trustedPeersChanged();
 }
 
 void TransferManager::removeTrustedPeer(const QString &peerId)
@@ -230,6 +266,8 @@ void TransferManager::removeTrustedPeer(const QString &peerId)
     settings.beginGroup(QStringLiteral("trustedPeers"));
     settings.remove(peerId);
     settings.endGroup();
+    settings.sync();
+    emit trustedPeersChanged();
 }
 
 bool TransferManager::isPaired(const QString &peerId) const
@@ -370,11 +408,35 @@ void TransferManager::rejectPairing(const QString &peerId)
 
 void TransferManager::forgetPeer(const QString &peerId)
 {
+    if (!isValidPeerId(peerId)) return;
     ++m_connections[peerId].reconnectGeneration;
     removeTrustedPeer(peerId);
     setConnectionState(peerId, ConnectionState::Unpaired);
-    if (auto *socket = m_sessions.take(peerId).data()) cleanupSocket(socket);
+
+    QList<QTcpSocket *> sockets;
+    for (auto it = m_tasks.cbegin(); it != m_tasks.cend(); ++it)
+        if (it.value() && it.value()->peerId == peerId) sockets.append(it.key());
+    for (QTcpSocket *socket : std::as_const(sockets)) {
+        const auto *context = m_tasks.value(socket);
+        cleanupSocket(socket, context && !context->isControl
+                                  ? QStringLiteral("cancelled") : QString{}, false);
+    }
+
+    const auto unfinished = m_transferStore.unfinished();
+    for (const PersistedTransfer &transfer : unfinished) {
+        if (transfer.peerId != peerId) continue;
+        m_cancelledTransferIds.insert(transfer.id);
+        m_pendingOutgoing.remove(transfer.id);
+        m_activeTransferIds.remove(transfer.id);
+        m_transferRetryAttempts.remove(transfer.id);
+        if (!transfer.isSender && !transfer.partialPath.isEmpty())
+            QFile::remove(transfer.partialPath);
+        emit taskUpdated(transfer.id, transfer.progress, QStringLiteral("cancelled"),
+                         transfer.checksum.toHex());
+    }
+    m_sessions.remove(peerId);
     m_connections.remove(peerId);
+    emit trustedPeersChanged();
 }
 
 void TransferManager::deviceAvailable(const QString &peerId, const QString &peerName,
@@ -382,11 +444,10 @@ void TransferManager::deviceAvailable(const QString &peerId, const QString &peer
 {
     if (!isTrusted(peerId) || ip.isEmpty() || port == 0) return;
     auto &peer = m_connections[peerId];
-    const bool endpointChanged = peer.ip != ip || peer.port != port || peer.name != peerName;
     peer.name = peerName;
     peer.ip = ip;
     peer.port = port;
-    if (endpointChanged) saveTrustedPeer(peerId, peerName, ip, port);
+    saveTrustedPeer(peerId, peerName, ip, port);
     if (peer.state != ConnectionState::Offline) return;
     for (auto *context : std::as_const(m_tasks))
         if (context->isControl && context->peerId == peerId) return;

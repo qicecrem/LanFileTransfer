@@ -261,11 +261,38 @@ public:
         if (!require(digest(receivedPath) == digest(sourcePath),
                      "resumed file content is incorrect")) return 13;
 
+        const QVariantList trusted = left.trustedPeers();
+        const QVariantMap trustedPeer = trusted.isEmpty() ? QVariantMap{} : trusted.first().toMap();
+        if (!require(trusted.size() == 1
+                     && trustedPeer.value(QStringLiteral("id")).toString() == QStringLiteral("peer-b")
+                     && trustedPeer.value(QStringLiteral("online")).toBool()
+                     && trustedPeer.value(QStringLiteral("lastSeen")).toLongLong() > 0,
+                     "trusted peer list does not reflect the live session")) return 14;
+
+        PersistedTransfer pending;
+        pending.id = QStringLiteral("pending-before-forget");
+        pending.peerId = QStringLiteral("peer-b");
+        pending.peerName = QStringLiteral("Right");
+        pending.peerIp = localhost;
+        pending.peerPort = right.serverPort();
+        pending.isSender = true;
+        pending.sourcePath = sourcePath;
+        pending.fileName = QStringLiteral("pending.bin");
+        pending.totalBytes = SourceSize;
+        pending.status = QStringLiteral("paused");
+        if (!require(left.m_transferStore.upsert(pending),
+                     "pending transfer setup failed")) return 15;
+
         left.forgetPeer(QStringLiteral("peer-b"));
+        const auto cancelled = left.m_transferStore.find(pending.id);
         right.forgetPeer(QStringLiteral("peer-a"));
         if (!require(left.connectionState(QStringLiteral("peer-b")) == QStringLiteral("unpaired")
                      && right.connectionState(QStringLiteral("peer-a")) == QStringLiteral("unpaired"),
-                     "forget peer did not clear trust state")) return 14;
+                     "forget peer did not clear trust state")) return 16;
+        if (!require(left.trustedPeers().isEmpty() && right.trustedPeers().isEmpty(),
+                     "forgotten peer remains in trusted device list")) return 17;
+        if (!require(cancelled && cancelled->status == QStringLiteral("cancelled"),
+                     "forget peer did not cancel unfinished transfer")) return 18;
         return 0;
     }
 };

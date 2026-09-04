@@ -83,12 +83,14 @@ void CallManager::setState(const QString &s) { if(s==m_state)return;qCInfo(lcCal
 void CallManager::setAudioMuted(bool muted) { if(m_audioMuted==muted)return; m_audioMuted=muted; emit controlsChanged(); if(m_state=="connected")startCapture(); }
 void CallManager::setVideoMuted(bool muted) { if(m_videoMuted==muted)return; m_videoMuted=muted; emit controlsChanged(); if(m_state=="connected")startCapture(); }
 void CallManager::allowPeer(const QString &ip) { if(!ip.isEmpty()){m_allowedPeers.insert(ip);qCInfo(lcCall)<<"Allowed media peer"<<ip;} }
-void CallManager::revokePeer(const QString &ip) { m_allowedPeers.remove(ip);qCInfo(lcCall)<<"Revoked media peer"<<ip; }
+void CallManager::revokePeer(const QString &ip) { m_allowedPeers.remove(ip);qCInfo(lcCall)<<"Revoked media peer"<<ip;if(!ip.isEmpty()&&m_peerIp==ip)hangup(); }
 
 void CallManager::attachSocket(QTcpSocket *socket)
 {
     qCInfo(lcCall)<<"Attaching media socket"<<socket<<"peer"<<socket->peerAddress().toString();
     m_socket=socket; m_buffer.clear();
+    const QString connectedPeer=socket->peerAddress().toString().remove(QStringLiteral("::ffff:"));
+    if(!connectedPeer.isEmpty())m_peerIp=connectedPeer;
     const QPointer<QTcpSocket> guardedSocket(socket);
     connect(socket,&QTcpSocket::readyRead,this,[this,guardedSocket]{
         if(!guardedSocket||m_socket!=guardedSocket)return;
@@ -96,7 +98,7 @@ void CallManager::attachSocket(QTcpSocket *socket)
     });
     connect(socket,&QTcpSocket::disconnected,this,[this,socket]{
         qCInfo(lcCall)<<"Media socket disconnected"<<socket->errorString();
-        if(m_socket==socket){m_socket=nullptr;stopCapture();setState("idle");} socket->deleteLater();
+        if(m_socket==socket){m_socket=nullptr;m_peerIp.clear();stopCapture();setState("idle");} socket->deleteLater();
     });
     connect(socket,&QTcpSocket::errorOccurred,this,[this,guardedSocket](QAbstractSocket::SocketError){
         if(guardedSocket&&m_socket==guardedSocket){qCWarning(lcCall)<<"Media socket error"<<guardedSocket->errorString();emit callError(guardedSocket->errorString());}
@@ -108,6 +110,7 @@ void CallManager::startCall(const QString &ip,quint16 port,const QString &mode)
     qCInfo(lcCall)<<"startCall"<<ip<<port<<mode;
     if(m_socket || ip.isEmpty() || port==0) return;
     if(!m_allowedPeers.contains(ip)){qCWarning(lcCall)<<"Call rejected because peer is not paired"<<ip;emit callError("Pair with this device before starting a call");return;}
+    m_peerIp=ip;
     m_mode=mode=="screen"?"screen":"camera"; emit stateChanged();
     auto *socket=new QTcpSocket(this); attachSocket(socket); setState("calling");
     connect(socket,&QTcpSocket::connected,this,[this]{sendPacket(Invite,m_mode.toUtf8());});
@@ -116,7 +119,7 @@ void CallManager::startCall(const QString &ip,quint16 port,const QString &mode)
 
 void CallManager::acceptCall() { qCInfo(lcCall)<<"acceptCall state"<<m_state<<"mode"<<m_mode;if(!m_socket||m_state!="incoming")return; sendPacket(Accept,m_mode.toUtf8()); setState("connected"); startCapture(); }
 void CallManager::rejectCall() { qCInfo(lcCall)<<"rejectCall";if(m_socket)sendPacket(Reject); hangup(); }
-void CallManager::hangup() { qCInfo(lcCall)<<"hangup";if(m_socket){sendPacket(Hangup);auto *s=m_socket;m_socket=nullptr;s->disconnectFromHost();} stopCapture();setState("idle"); }
+void CallManager::hangup() { qCInfo(lcCall)<<"hangup";if(m_socket){sendPacket(Hangup);auto *s=m_socket;m_socket=nullptr;s->disconnectFromHost();}m_peerIp.clear();stopCapture();setState("idle"); }
 void CallManager::switchMode(const QString &mode) { qCInfo(lcCall)<<"switchMode"<<mode;m_mode=mode=="screen"?"screen":"camera"; sendPacket(SwitchMode,m_mode.toUtf8()); if(m_state=="connected")startCapture(); emit stateChanged(); }
 void CallManager::startLocalDiagnostic(const QString &mode)
 {

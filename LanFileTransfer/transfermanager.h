@@ -10,6 +10,7 @@
 #include <QPointer>
 #include <QHash>
 #include <QSet>
+#include <QVariantList>
 #include <functional>
 
 struct TransferContext {
@@ -42,6 +43,7 @@ class TransferManager : public QObject {
     QML_ELEMENT
     Q_PROPERTY(QString saveDirectory READ saveDirectory WRITE setSaveDirectory NOTIFY saveDirectoryChanged)
     Q_PROPERTY(quint16 serverPort READ serverPort CONSTANT)
+    Q_PROPERTY(QVariantList trustedPeers READ trustedPeers NOTIFY trustedPeersChanged)
 public:
     enum class ConnectionState { Unpaired, Pairing, Online, Reconnecting, Offline };
     Q_ENUM(ConnectionState)
@@ -50,6 +52,7 @@ public:
     explicit TransferManager(const TransferManagerOptions &options, QObject *parent=nullptr);
     quint16 serverPort() const { return m_server->serverPort(); }
     QString saveDirectory() const { return m_saveDirectory; }
+    QVariantList trustedPeers() const;
     Q_INVOKABLE void setSaveDirectory(const QString &dirUrl);
     Q_INVOKABLE void openFolder();
     Q_INVOKABLE void sendFiles(const QList<QUrl> &files,const QString &ip,quint16 port);
@@ -80,6 +83,7 @@ signals:
     // Canonical values: unpaired, pairing, online, reconnecting, offline.
     void pairingStateChanged(QString peerId,QString state);
     void peerAuthorizationChanged(QString peerId,QString ip,bool allowed);
+    void trustedPeersChanged();
 private:
     friend class TransferManagerIntegrationTest;
     void onNewConnection();
@@ -100,6 +104,7 @@ private:
         QString name;
         QString ip;
         quint16 port=0;
+        qint64 lastSeen=0;
         bool trusted=false;
         ConnectionState state=ConnectionState::Unpaired;
         int reconnectAttempt=0;

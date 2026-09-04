@@ -34,6 +34,8 @@ ApplicationWindow {
     property string pairingPeerId: ""
     property string pairingPeerName: ""
     property string pairingPeerIp: ""
+    property string pendingForgetPeerId: ""
+    property string pendingForgetPeerName: ""
     property int pairingRevision: 0
     property var pendingFiles: []
 
@@ -77,6 +79,21 @@ ApplicationWindow {
     function targetReady() {
         const dependency = pairingRevision
         return targetId !== "" && transfer.isPaired(targetId)
+    }
+    function connectionStateLabel(state) {
+        const labels = {
+            "online": copy("在线", "Online"),
+            "reconnecting": copy("重连中", "Reconnecting"),
+            "offline": copy("离线", "Offline"),
+            "pairing": copy("配对中", "Pairing"),
+            "unpaired": copy("未配对", "Unpaired")
+        }
+        return labels[state] || state
+    }
+    function lastSeenLabel(value) {
+        const timestamp = Number(value || 0)
+        if (timestamp <= 0) return copy("未知", "Unknown")
+        return Qt.formatDateTime(new Date(timestamp), "yyyy-MM-dd HH:mm")
     }
     function openPeer(peer) {
         if (transfer.isPaired(peer.id)) selectPeer(peer)
@@ -575,8 +592,18 @@ ApplicationWindow {
     Drawer {
         id: settingsDrawer; width: Math.min(root.width * .92, 400); height: root.height; edge: Qt.RightEdge
         background: Rectangle { color: root.surface }
-        ColumnLayout {
-            anchors.fill: parent; anchors.margins: 26; spacing: 16
+        ScrollView {
+            id: settingsScroll
+            anchors.fill: parent; clip: true
+            contentWidth: availableWidth
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            Item {
+                width: settingsScroll.availableWidth
+                implicitHeight: settingsContent.implicitHeight + 52
+                ColumnLayout {
+                    id: settingsContent
+                    anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+                    anchors.margins: 26; spacing: 16
             RowLayout {
                 Layout.fillWidth: true
                 ColumnLayout {
@@ -609,6 +636,13 @@ ApplicationWindow {
             }
             SettingsSwitch { visible: !isMobile; text: t("minimizeToTray"); checked: app.minimizeToTray; onToggled: app.minimizeToTray = checked }
             SettingsSwitch { visible: isMobile; text: t("keepAwake"); checked: app.keepAwake; onToggled: app.keepAwake = checked }
+            Label { text: root.copy("可信设备", "Trusted devices"); color: root.ink; font.weight: Font.DemiBold }
+            ModernButton {
+                Layout.fillWidth: true; glyph: "devices"
+                text: root.copy("管理可信设备", "Manage trusted devices")
+                      + " (" + transfer.trustedPeers.length + ")"
+                onClicked: trustedDevicesDialog.open()
+            }
             Label { text: root.copy("诊断与支持", "Diagnostics and support"); color: root.ink; font.weight: Font.DemiBold }
             Label {
                 Layout.fillWidth: true; wrapMode: Text.Wrap
@@ -621,13 +655,15 @@ ApplicationWindow {
                 text: root.copy("导出诊断包", "Export diagnostic package")
                 onClicked: app.exportDiagnosticBundle()
             }
-            Item { Layout.fillHeight: true }
+            Item { Layout.fillWidth: true; Layout.preferredHeight: 4 }
             Rectangle {
                 Layout.fillWidth: true; Layout.preferredHeight: 72; radius: 10; color: "#EAF6FA"
                 RowLayout {
                     anchors.fill: parent; anchors.margins: 14
                     Text { text: "verified_user"; font.family: root.iconFamily; font.pixelSize: 24; color: root.cyanDark }
                     Label { Layout.fillWidth: true; text: root.copy("SQLite 离线历史 · SHA-256 校验 · 断点续传", "SQLite offline history · SHA-256 · Resume"); wrapMode: Text.Wrap; color: root.ink; font.pixelSize: 11 }
+                }
+            }
                 }
             }
         }
@@ -822,6 +858,122 @@ ApplicationWindow {
                 Layout.fillWidth: true; Item { Layout.fillWidth: true }
                 ModernButton { text: t("decline"); onClicked: { transfer.rejectPairing(root.pairingPeerId); pairingDialog.close() } }
                 ModernButton { text: t("accept"); primary: true; onClicked: { transfer.acceptPairing(root.pairingPeerId); pairingDialog.close() } }
+            }
+        }
+    }
+
+    Dialog {
+        id: trustedDevicesDialog
+        anchors.centerIn: parent
+        width: Math.min(root.width - 32, 560)
+        height: Math.min(root.height - 48, 620)
+        modal: true; padding: 0; standardButtons: Dialog.NoButton
+        background: Rectangle { radius: 18; color: root.surface; border.color: root.line }
+        contentItem: ColumnLayout {
+            spacing: 0
+            RowLayout {
+                Layout.fillWidth: true; Layout.margins: 22; Layout.bottomMargin: 16
+                ColumnLayout {
+                    spacing: 2
+                    Label { text: root.copy("可信设备", "Trusted devices"); color: root.ink; font.pixelSize: 20; font.weight: Font.Bold }
+                    Label { text: root.copy("管理已保存的局域网设备授权", "Manage saved LAN device access"); color: root.muted; font.pixelSize: 11 }
+                }
+                Item { Layout.fillWidth: true }
+                IconAction { glyph: "close"; tip: root.copy("关闭", "Close"); onClicked: trustedDevicesDialog.close() }
+            }
+            Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.line }
+            ListView {
+                id: trustedDevicesList
+                Layout.fillWidth: true; Layout.fillHeight: true
+                Layout.margins: 18; clip: true; spacing: 8
+                model: transfer.trustedPeers
+                ScrollIndicator.vertical: ScrollIndicator { }
+                Label {
+                    anchors.centerIn: parent; visible: trustedDevicesList.count === 0
+                    width: parent.width - 32; horizontalAlignment: Text.AlignHCenter
+                    text: root.copy("还没有可信设备\n首次配对成功后会显示在这里",
+                                    "No trusted devices yet\nDevices appear here after pairing")
+                    color: root.muted; wrapMode: Text.Wrap; lineHeight: 1.35
+                }
+                delegate: Rectangle {
+                    id: trustedDeviceRow
+                    required property var modelData
+                    width: ListView.view.width; height: 92; radius: 12
+                    color: "#F7FAFC"; border.color: root.line
+                    RowLayout {
+                        anchors.fill: parent; anchors.margins: 12; spacing: 11
+                        Rectangle {
+                            Layout.preferredWidth: 42; Layout.preferredHeight: 42; radius: 11
+                            color: trustedDeviceRow.modelData.online ? "#DDF6EA" : "#E8EEF3"
+                            Text {
+                                anchors.centerIn: parent; text: "computer"; font.family: root.iconFamily; font.pixelSize: 23
+                                color: trustedDeviceRow.modelData.online ? "#16845B" : root.muted
+                            }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            Label {
+                                Layout.fillWidth: true; text: trustedDeviceRow.modelData.name || trustedDeviceRow.modelData.id
+                                color: root.ink; font.pixelSize: 14; font.weight: Font.DemiBold; elide: Text.ElideRight
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: root.connectionStateLabel(trustedDeviceRow.modelData.state)
+                                      + " · " + root.lastSeenLabel(trustedDeviceRow.modelData.lastSeen)
+                                color: trustedDeviceRow.modelData.online ? "#16845B" : root.muted
+                                font.pixelSize: 11; elide: Text.ElideRight
+                            }
+                            Label {
+                                Layout.fillWidth: true; text: trustedDeviceRow.modelData.id
+                                color: "#98A8B5"; font.pixelSize: 9; elide: Text.ElideMiddle
+                            }
+                        }
+                        IconAction {
+                            glyph: "delete_outline"; iconColor: "#B54A4A"
+                            tip: root.copy("解除配对", "Forget device")
+                            onClicked: {
+                                root.pendingForgetPeerId = trustedDeviceRow.modelData.id
+                                root.pendingForgetPeerName = trustedDeviceRow.modelData.name
+                                forgetPeerDialog.open()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: forgetPeerDialog
+        anchors.centerIn: parent
+        width: Math.min(root.width - 40, 430)
+        modal: true; padding: 24; standardButtons: Dialog.NoButton
+        background: Rectangle { radius: 16; color: root.surface; border.color: root.line }
+        contentItem: ColumnLayout {
+            spacing: 14
+            Label { text: root.copy("解除设备配对？", "Forget this device?"); color: root.ink; font.pixelSize: 18; font.weight: Font.Bold }
+            Label {
+                Layout.fillWidth: true; wrapMode: Text.Wrap; color: root.muted; lineHeight: 1.3
+                text: root.copy("将撤销“" + root.pendingForgetPeerName + "”的本机授权并取消未完成传输。聊天记录和已接收文件会保留。",
+                                "This revokes local access for “" + root.pendingForgetPeerName + "” and cancels unfinished transfers. Chat history and received files are kept.")
+            }
+            RowLayout {
+                Layout.fillWidth: true; spacing: 10
+                Item { Layout.fillWidth: true }
+                ModernButton { text: root.copy("取消", "Cancel"); onClicked: forgetPeerDialog.close() }
+                ModernButton {
+                    text: root.copy("解除配对", "Forget"); primary: true
+                    onClicked: {
+                        const forgottenId = root.pendingForgetPeerId
+                        transfer.forgetPeer(forgottenId)
+                        if (root.targetId === forgottenId) {
+                            root.targetId = ""; root.targetIp = ""; root.targetPort = 0
+                            root.targetMediaPort = 0; root.targetName = ""; timeline.clear()
+                        }
+                        forgetPeerDialog.close()
+                        toast.show(root.copy("已解除配对", "Device forgotten"))
+                    }
+                }
             }
         }
     }

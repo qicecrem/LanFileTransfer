@@ -93,6 +93,7 @@ private:
     QIODevice *m_audioInput = nullptr;
     QIODevice *m_audioOutput = nullptr;
     QByteArray m_buffer;
+    QString m_peerIp;
     QString m_state = "idle";
     QString m_mode = "camera";
     int m_localRevision = 0;
