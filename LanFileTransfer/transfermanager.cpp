@@ -27,7 +27,6 @@ constexpr quint32 MaxPacketSize = 4 * 1024 * 1024;
 constexpr qsizetype MaxDataChunkSize = 512 * 1024;
 constexpr qsizetype MaxTextLength = 64 * 1024;
 constexpr qint64 SessionTimeoutMs = 45000;
-constexpr int MaxReconnectAttempts = 5;
 
 bool isValidPeerId(const QString &peerId)
 {
@@ -85,7 +84,18 @@ bool copyToAndroidDirectory(const QString &treeUri, const QString &sourcePath, c
 #endif
 }
 
-TransferManager::TransferManager(QObject *parent) : QObject(parent)
+TransferManager::TransferManager(QObject *parent)
+    : TransferManager(TransferManagerOptions{}, parent)
+{
+}
+
+TransferManager::TransferManager(const TransferManagerOptions &options, QObject *parent)
+    : QObject(parent),
+      m_transferStore(options.transferDatabasePath),
+      m_settingsOrganization(options.settingsOrganization),
+      m_settingsApplication(options.settingsApplication),
+      m_reconnectBaseDelayMs(qMax(1, options.reconnectBaseDelayMs)),
+      m_maxReconnectAttempts(qMax(1, options.maxReconnectAttempts))
 {
     connect(this, &TransferManager::taskUpdated, this,
             [this](const QString &id, qreal progress, const QString &status, const QString &checksum) {
@@ -95,22 +105,28 @@ TransferManager::TransferManager(QObject *parent) : QObject(parent)
             [this](const QString &id, qint64 totalBytes) {
         m_transferStore.updateSize(id, totalBytes);
     });
-    QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
-    m_localId = settings.value(QStringLiteral("identity/instanceId")).toString();
+    QSettings settings(m_settingsOrganization, m_settingsApplication);
+    m_localId = options.localId.isEmpty()
+        ? settings.value(QStringLiteral("identity/instanceId")).toString()
+        : options.localId;
     if (m_localId.isEmpty()) {
         m_localId = QUuid::createUuid().toString(QUuid::WithoutBraces);
         settings.setValue(QStringLiteral("identity/instanceId"), m_localId);
     }
     loadTrustedPeers();
+    if (!options.saveDirectory.isEmpty()) {
+        m_saveDirectory = options.saveDirectory;
+    } else {
 #ifdef Q_OS_ANDROID
-    m_saveDirectory = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
-                          .filePath(QStringLiteral("Received"));
+        m_saveDirectory = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
+                              .filePath(QStringLiteral("Received"));
 #else
-    m_saveDirectory = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+        m_saveDirectory = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
 #endif
+    }
     QDir().mkpath(m_saveDirectory);
     m_server = new QTcpServer(this);
-    if (!m_server->listen(QHostAddress::AnyIPv4, 0))
+    if (!m_server->listen(QHostAddress::AnyIPv4, options.listenPort))
         emit transferError(tr("无法启动文件接收服务：%1").arg(m_server->errorString()));
     connect(m_server, &QTcpServer::newConnection, this, &TransferManager::onNewConnection);
     auto *keepAlive = new QTimer(this);
@@ -168,7 +184,7 @@ void TransferManager::setConnectionState(const QString &peerId, ConnectionState 
 
 void TransferManager::loadTrustedPeers()
 {
-    QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
+    QSettings settings(m_settingsOrganization, m_settingsApplication);
     settings.beginGroup(QStringLiteral("trustedPeers"));
     for (const QString &peerId : settings.childGroups()) {
         settings.beginGroup(peerId);
@@ -197,7 +213,7 @@ void TransferManager::saveTrustedPeer(const QString &peerId, const QString &name
     peer.name = name;
     peer.ip = ip;
     if (port) peer.port = port;
-    QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
+    QSettings settings(m_settingsOrganization, m_settingsApplication);
     settings.beginGroup(QStringLiteral("trustedPeers"));
     settings.beginGroup(peerId);
     settings.setValue(QStringLiteral("name"), peer.name);
@@ -210,7 +226,7 @@ void TransferManager::saveTrustedPeer(const QString &peerId, const QString &name
 void TransferManager::removeTrustedPeer(const QString &peerId)
 {
     if (m_connections.contains(peerId)) m_connections[peerId].trusted = false;
-    QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
+    QSettings settings(m_settingsOrganization, m_settingsApplication);
     settings.beginGroup(QStringLiteral("trustedPeers"));
     settings.remove(peerId);
     settings.endGroup();
@@ -288,7 +304,7 @@ void TransferManager::openControlConnection(const QString &peerId, const QString
     connect(socket, &QTcpSocket::connected, this, [this, socket] {
         auto *item = m_tasks.value(socket);
         if (!item) return;
-        QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
+        QSettings settings(m_settingsOrganization, m_settingsApplication);
         const QString localName = settings.value(QStringLiteral("identity/deviceName"),
                                                   QHostInfo::localHostName()).toString();
         sendPacket(socket, MsgPairRequest, [this, localName](QDataStream &out) {
@@ -314,19 +330,27 @@ void TransferManager::acceptPairing(const QString &peerId)
     for (auto it = m_tasks.cbegin(); it != m_tasks.cend(); ++it) {
         auto *item = it.value();
         if (!item->isControl || item->isSender || item->peerId != peerId || item->paired) continue;
-        item->paired = true;
-        const bool adopted = establishSession(it.key(), item);
-        QSettings settings(QStringLiteral("Lantern Labs"), QStringLiteral("LanDrop"));
-        const QString localName = settings.value(QStringLiteral("identity/deviceName"),
-                                                  QHostInfo::localHostName()).toString();
-        sendPacket(it.key(), MsgPairAccept, [this, localName](QDataStream &out) {
-            out << m_localId << localName << serverPort();
-        });
-        if (!adopted) {
-            it.key()->flush();
-            it.key()->disconnectFromHost();
-        }
+        acceptPairingSocket(it.key());
         return;
+    }
+}
+
+void TransferManager::acceptPairingSocket(QTcpSocket *socket)
+{
+    auto *item = m_tasks.value(socket);
+    if (!item || !item->isControl || item->isSender || item->peerId.isEmpty() || item->paired)
+        return;
+    item->paired = true;
+    const bool adopted = establishSession(socket, item);
+    QSettings settings(m_settingsOrganization, m_settingsApplication);
+    const QString localName = settings.value(QStringLiteral("identity/deviceName"),
+                                              QHostInfo::localHostName()).toString();
+    sendPacket(socket, MsgPairAccept, [this, localName](QDataStream &out) {
+        out << m_localId << localName << serverPort();
+    });
+    if (!adopted) {
+        socket->flush();
+        socket->disconnectFromHost();
     }
 }
 
@@ -697,8 +721,9 @@ void TransferManager::onReadyRead(QTcpSocket *socket)
                 peer.name = context->peerName;
                 peer.ip = context->peerIp;
                 if (peerPort) peer.port = peerPort;
-                setConnectionState(peerId, ConnectionState::Reconnecting);
-                acceptPairing(peerId);
+                if (!isPaired(peerId))
+                    setConnectionState(peerId, ConnectionState::Reconnecting);
+                acceptPairingSocket(socket);
             } else {
                 setConnectionState(peerId, ConnectionState::Pairing);
                 emit pairingRequested(peerId, context->peerName, context->peerIp);
@@ -1027,7 +1052,7 @@ bool TransferManager::establishSession(QTcpSocket *socket, TransferContext *cont
         && previousContext->isSender == preferOutgoing;
     if (previous && previous != socket && previousContext
         && previous->state() == QAbstractSocket::ConnectedState
-        && (!newPreferred || previousPreferred)) {
+        && previousPreferred && !newPreferred) {
         context->paired = true;
         context->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
         qInfo() << "Ignoring duplicate control session for" << context->peerId
@@ -1054,14 +1079,14 @@ void TransferManager::scheduleReconnect(const QString &peerId)
 {
     if (!isTrusted(peerId) || peerId.isEmpty()) return;
     auto &peer = m_connections[peerId];
-    if (peer.ip.isEmpty() || peer.port == 0 || peer.reconnectAttempt >= MaxReconnectAttempts) {
+    if (peer.ip.isEmpty() || peer.port == 0 || peer.reconnectAttempt >= m_maxReconnectAttempts) {
         setConnectionState(peerId, ConnectionState::Offline);
         return;
     }
     setConnectionState(peerId, ConnectionState::Reconnecting);
     const int attempt = ++peer.reconnectAttempt;
     const quint64 generation = ++peer.reconnectGeneration;
-    const int delayMs = qMin(30000, 1000 * (1 << qMin(attempt - 1, 5)));
+    const int delayMs = qMin(30000, m_reconnectBaseDelayMs * (1 << qMin(attempt - 1, 5)));
     QTimer::singleShot(delayMs, this, [this, peerId, generation] {
         auto it = m_connections.find(peerId);
         if (it == m_connections.end() || it->reconnectGeneration != generation
@@ -1096,9 +1121,9 @@ void TransferManager::cleanupSocket(QTcpSocket *socket, const QString &status, b
                 if (transfer) {
                     enqueueOutgoing(*transfer, false);
                     const int attempt = ++m_transferRetryAttempts[context->id];
-                    if (attempt <= MaxReconnectAttempts && isPaired(transfer->peerId)) {
+                    if (attempt <= m_maxReconnectAttempts && isPaired(transfer->peerId)) {
                         const QString transferId = context->id;
-                        const int delayMs = qMin(30000, 1000 * (1 << qMin(attempt - 1, 5)));
+                        const int delayMs = qMin(30000, m_reconnectBaseDelayMs * (1 << qMin(attempt - 1, 5)));
                         QTimer::singleShot(delayMs, this, [this, transferId] {
                             auto it = m_pendingOutgoing.find(transferId);
                             if (it == m_pendingOutgoing.end() || !isPaired(it->transfer.peerId)) return;

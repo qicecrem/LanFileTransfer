@@ -147,6 +147,18 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_link_libraries(transferprotocol_test PRIVATE Qt6::Core)
     add_test(NAME transferprotocol_test COMMAND transferprotocol_test)
 
+    add_executable(transfermanager_integration_test
+        tests/transfermanager_integration_test.cpp
+        transfermanager.h transfermanager.cpp
+        transferprotocol.h
+        transferstore.h transferstore.cpp
+    )
+    target_include_directories(transfermanager_integration_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(transfermanager_integration_test PRIVATE
+        Qt6::Core Qt6::Gui Qt6::Qml Qt6::Network Qt6::Sql Qt6::Concurrent)
+    add_test(NAME transfermanager_integration_test COMMAND transfermanager_integration_test)
+    set_tests_properties(transfermanager_integration_test PROPERTIES TIMEOUT 60)
+
     add_executable(diagnosticlog_test
         tests/diagnosticlog_test.cpp
         diagnosticlog.h diagnosticlog.cpp

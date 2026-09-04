@@ -26,6 +26,17 @@ struct TransferContext {
     int lastProgressPct=-1;
 };
 
+struct TransferManagerOptions {
+    QString localId;
+    QString settingsOrganization = QStringLiteral("Lantern Labs");
+    QString settingsApplication = QStringLiteral("LanDrop");
+    QString transferDatabasePath;
+    QString saveDirectory;
+    quint16 listenPort = 0;
+    int reconnectBaseDelayMs = 1000;
+    int maxReconnectAttempts = 5;
+};
+
 class TransferManager : public QObject {
     Q_OBJECT
     QML_ELEMENT
@@ -36,6 +47,7 @@ public:
     Q_ENUM(ConnectionState)
 
     explicit TransferManager(QObject *parent=nullptr);
+    explicit TransferManager(const TransferManagerOptions &options, QObject *parent=nullptr);
     quint16 serverPort() const { return m_server->serverPort(); }
     QString saveDirectory() const { return m_saveDirectory; }
     Q_INVOKABLE void setSaveDirectory(const QString &dirUrl);
@@ -69,6 +81,7 @@ signals:
     void pairingStateChanged(QString peerId,QString state);
     void peerAuthorizationChanged(QString peerId,QString ip,bool allowed);
 private:
+    friend class TransferManagerIntegrationTest;
     void onNewConnection();
     void onReadyRead(QTcpSocket *socket);
     void sendPacket(QTcpSocket *socket,MessageType type,const std::function<void(QDataStream&)> &writer={});
@@ -96,6 +109,7 @@ private:
     void setConnectionState(const QString &peerId,ConnectionState state);
     void loadTrustedPeers();
     bool isTrusted(const QString &peerId) const;
+    void acceptPairingSocket(QTcpSocket *socket);
     void saveTrustedPeer(const QString &peerId,const QString &name,const QString &ip,quint16 port);
     void removeTrustedPeer(const QString &peerId);
     void openControlConnection(const QString &peerId,const QString &peerName,const QString &ip,
@@ -118,4 +132,8 @@ private:
     TransferStore m_transferStore;
     bool m_transfersRestored=false;
     QString m_localId;
+    QString m_settingsOrganization;
+    QString m_settingsApplication;
+    int m_reconnectBaseDelayMs=1000;
+    int m_maxReconnectAttempts=5;
 };
