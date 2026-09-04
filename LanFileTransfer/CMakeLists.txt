@@ -78,6 +78,7 @@ qt_add_qml_module(appLanFileTransfer
     # 这些文件中定义的 QObject 派生类会自动注册到 QML 类型系统
     SOURCES
         transfermanager.h transfermanager.cpp
+        transferprotocol.h
         transferstore.h transferstore.cpp
         discoveryservice.h discoveryservice.cpp
         appcontroller.h appcontroller.cpp
@@ -137,6 +138,14 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_include_directories(transferstore_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(transferstore_test PRIVATE Qt6::Core Qt6::Sql)
     add_test(NAME transferstore_test COMMAND transferstore_test)
+
+    add_executable(transferprotocol_test
+        tests/transferprotocol_test.cpp
+        transferprotocol.h
+    )
+    target_include_directories(transferprotocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(transferprotocol_test PRIVATE Qt6::Core)
+    add_test(NAME transferprotocol_test COMMAND transferprotocol_test)
 
     add_executable(diagnosticlog_test
         tests/diagnosticlog_test.cpp

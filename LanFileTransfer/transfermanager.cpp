@@ -1,4 +1,5 @@
 #include "transfermanager.h"
+#include "transferprotocol.h"
 
 #include <QCryptographicHash>
 #include <QDataStream>
@@ -873,9 +874,16 @@ void TransferManager::onReadyRead(QTcpSocket *socket)
                 fail(); return;
             }
             if (context->isSender) {
-                emit taskUpdated(context->id, ok ? 1 : 0,
-                                 ok ? QStringLiteral("verified") : QStringLiteral("checksum-error"),
-                                 hash.toHex());
+                const bool verified = TransferProtocol::isCompletionVerified(
+                    ok, hash, context->checksum);
+                if (!verified) {
+                    qWarning() << "Transfer completion rejected or checksum mismatch"
+                               << context->id << "peerAccepted" << ok;
+                }
+                emit taskUpdated(context->id, verified ? 1 : 0,
+                                 verified ? QStringLiteral("verified")
+                                          : QStringLiteral("checksum-error"),
+                                 context->checksum.toHex());
                 cleanupSocket(socket);
                 return;
             }
