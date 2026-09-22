@@ -124,7 +124,7 @@ QList<PersistedTransfer> TransferStore::unfinished() const
     query.prepare(QStringLiteral("SELECT ") + QString::fromLatin1(Columns)
         + QStringLiteral(" FROM transfer_tasks "
                          "WHERE status NOT IN ('verified','cancelled','read-error','write-error',"
-                         "'checksum-error','protocol-error') "
+                         "'checksum-error','protocol-error','no-space','rejected') "
                          "ORDER BY created_at"));
     if (!query.exec()) return result;
     while (query.next()) result.append(fromQuery(query));

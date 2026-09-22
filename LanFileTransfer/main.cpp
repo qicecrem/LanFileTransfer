@@ -1,5 +1,6 @@
 #include <QApplication>
 #include <QQmlApplicationEngine>
+#include <QQmlContext>
 #include <QQmlError>
 #include <QNetworkProxy>
 #include <QIcon>
@@ -25,8 +26,10 @@ int main(int argc, char *argv[])
     QApplication app(argc, argv);
     app.setApplicationName("LanDrop");
     app.setOrganizationName("Lantern Labs");
-    app.setApplicationVersion("0.1");
+    app.setApplicationVersion(QStringLiteral(LANDROP_VERSION));
     DiagnosticLog::install();
+    const QStringList arguments = app.arguments();
+    const bool smokeTest = arguments.contains(QStringLiteral("--smoke-test"));
 #ifdef Q_OS_ANDROID
     const QJniObject diagnosticContext = QNativeInterface::QAndroidApplication::context();
     if (diagnosticContext.isValid()) {
@@ -49,8 +52,11 @@ int main(int argc, char *argv[])
 
 
     QQmlApplicationEngine engine;
+    bool qmlWarningSeen = false;
+    engine.rootContext()->setContextProperty(QStringLiteral("landropSmokeTest"), smokeTest);
     QObject::connect(&engine, &QQmlEngine::warnings, &app,
-                     [](const QList<QQmlError> &warnings) {
+                     [&qmlWarningSeen, smokeTest](const QList<QQmlError> &warnings) {
+        if (smokeTest && !warnings.isEmpty()) qmlWarningSeen = true;
         for (const QQmlError &warning : warnings)
             qWarning().noquote() << "QML" << warning.toString();
     });
@@ -80,6 +86,8 @@ int main(int argc, char *argv[])
             QMetaObject::invokeMethod(rootObject, "loadDesignPreview");
         if (qEnvironmentVariableIsSet("LANDROP_CALL_PREVIEW"))
             QMetaObject::invokeMethod(rootObject, "loadCallPreview");
+        if (arguments.contains(QStringLiteral("--call-preview")))
+            QMetaObject::invokeMethod(rootObject, "loadCallPreview");
     }
 
     const QString screenshotPath = qEnvironmentVariable("LANDROP_SCREENSHOT_PATH");
@@ -102,6 +110,10 @@ int main(int argc, char *argv[])
     const int smokeTestMs = qEnvironmentVariableIntValue("LANDROP_SMOKE_TEST_MS", &smokeTestOk);
     if (smokeTestOk && smokeTestMs > 0)
         QTimer::singleShot(smokeTestMs, &app, &QCoreApplication::quit);
+    else if (smokeTest)
+        QTimer::singleShot(1500, &app, [&qmlWarningSeen] {
+            QCoreApplication::exit(qmlWarningSeen ? 4 : 0);
+        });
 
 
 #ifdef Q_OS_ANDROID

@@ -7,7 +7,7 @@ import QtQuick.Window
 
 ApplicationWindow {
     id: root
-    visible: true
+    visible: !landropSmokeTest
     width: 1240; height: 800
     minimumWidth: isMobile ? 360 : 820
     minimumHeight: 560
@@ -38,10 +38,11 @@ ApplicationWindow {
     property string pendingForgetPeerName: ""
     property int pairingRevision: 0
     property var pendingFiles: []
+    property var conversationPeers: []
 
     FontLoader { id: materialIcons; source: "qrc:/MaterialIconsOutlined-Regular.otf" }
     ListModel { id: timeline }
-    AppController { id: app }
+    AppController { id: app; Component.onCompleted: Qt.callLater(root.refreshConversationPeers) }
     TransferManager { id: transfer }
     CallManager { id: calls }
     DiscoveryService {
@@ -56,11 +57,12 @@ ApplicationWindow {
             const peers = deviceList
             for (let i = 0; i < peers.length; ++i)
                 transfer.deviceAvailable(peers[i].id, peers[i].name, peers[i].ip, peers[i].port)
+            root.refreshConversationPeers()
         }
     }
 
     function t(key) { const languageDependency = app.language; return app.tr(key) }
-    function copy(zh, en) { return app.language.indexOf("zh") === 0 ? zh : en }
+    function copy(zh, en) { return app.effectiveLanguage.indexOf("zh") === 0 ? zh : en }
     function peerKeyForIp(ip) {
         const peers = discovery.deviceList
         for (let i = 0; i < peers.length; ++i) if (peers[i].ip === ip) return peers[i].id
@@ -96,8 +98,9 @@ ApplicationWindow {
         return Qt.formatDateTime(new Date(timestamp), "yyyy-MM-dd HH:mm")
     }
     function openPeer(peer) {
-        if (transfer.isPaired(peer.id)) selectPeer(peer)
-        else transfer.requestPairing(peer.id, peer.name, peer.ip, peer.port)
+        selectPeer(peer)
+        if (peer.online !== false && peer.ip && peer.port > 0 && !transfer.isPaired(peer.id))
+            transfer.requestPairing(peer.id, peer.name, peer.ip, peer.port)
     }
     function selectPeer(peer) {
         targetId = peer.id || peer.ip; targetIp = peer.ip; targetPort = peer.port
@@ -107,6 +110,30 @@ ApplicationWindow {
         for (let i = 0; i < saved.length; ++i) timeline.append(normalizeMessage(saved[i]))
         if (compact) deviceDrawer.close()
         Qt.callLater(function() { chat.positionViewAtEnd() })
+    }
+    function refreshConversationPeers() {
+        const rows = []
+        const seen = ({})
+        const online = discovery.deviceList
+        for (let i = 0; i < online.length; ++i) {
+            const peer = online[i]
+            rows.push({id:String(peer.id || peer.ip), name:String(peer.name || peer.ip),
+                       ip:String(peer.ip || ""), port:Number(peer.port || 0),
+                       mediaPort:Number(peer.mediaPort || 0), online:true,
+                       lastMessage:"", lastSeen:Date.now()})
+            seen[String(peer.id || peer.ip)] = true
+        }
+        const history = app.recentConversations()
+        for (let j = 0; j < history.length; ++j) {
+            const oldPeer = history[j]
+            const key = String(oldPeer.id || "")
+            if (!key || seen[key]) continue
+            rows.push({id:key, name:String(oldPeer.name || key), ip:"", port:0,
+                       mediaPort:0, online:false,
+                       lastMessage:String(oldPeer.lastMessage || ""),
+                       lastSeen:Number(oldPeer.lastSeen || 0)})
+        }
+        conversationPeers = rows
     }
     function normalizeMessage(data) {
         return {
@@ -155,6 +182,7 @@ ApplicationWindow {
         if (!targetId) return
         app.clearConversation(targetId)
         timeline.clear()
+        refreshConversationPeers()
         toast.show(root.copy("会话已清空", "Conversation cleared"))
     }
     function sendFilesOrReconnect(files) {
@@ -196,7 +224,7 @@ ApplicationWindow {
         }
     }
     function statusLabel(status) {
-        const zh = app.language.indexOf("zh") === 0
+        const zh = app.effectiveLanguage.indexOf("zh") === 0
         const map = {
             "connecting":["正在连接","Connecting"], "negotiating":["协商传输","Negotiating"],
             "transferring":["正在发送","Sending"], "receiving":["正在接收","Receiving"],
@@ -204,6 +232,7 @@ ApplicationWindow {
             "verified":["校验通过","Verified"], "paused":["等待续传","Waiting to resume"],
             "checksum-error":["校验失败","Checksum failed"], "read-error":["无法读取","Cannot read"],
             "write-error":["无法写入","Cannot write"], "cancelled":["已取消","Cancelled"],
+            "no-space":["空间不足","Not enough space"], "rejected":["对方未能保存","Rejected"],
             "sent":["已发送","Sent"], "received":["已收到","Received"]
         }
         return map[status] ? map[status][zh ? 0 : 1] : status
@@ -223,6 +252,7 @@ ApplicationWindow {
         function onQuitRequested() { Qt.quit() }
         function onDownloadDirectoryChanged() { transfer.saveDirectory = app.downloadDirectory }
         function onReceiveDirectorySelected(uri) { transfer.setSaveDirectory(uri) }
+        function onFilesSelected(files) { root.sendFilesOrReconnect(files) }
         function onDeviceNameChanged() { discovery.deviceName = app.deviceName }
         function onNetworkEnvironmentChanged() { discovery.refreshNetwork() }
         function onDiagnosticBundleReady(path) {
@@ -236,6 +266,7 @@ ApplicationWindow {
         function onTextReceived(ip, text) {
             const key = peerKeyForIp(ip), name = peerNameForIp(ip), now = Date.now()
             app.addMessage(key, name, false, "text", text, "", 0, "", "received")
+            root.refreshConversationPeers()
             if (key === targetId || ip === targetIp)
                 appendMessage({peerKey:key, peerName:name, outgoing:false, kind:"text", body:text,
                                fileName:"", fileSize:0, transferId:"", progress:1, status:"received",
@@ -245,6 +276,7 @@ ApplicationWindow {
         function onTaskAdded(taskId, peerIp, fileName, isSender, totalBytes) {
             const key = peerKeyForIp(peerIp), name = peerNameForIp(peerIp), now = Date.now()
             app.addMessage(key, name, isSender, "file", "", fileName, totalBytes, taskId, "connecting")
+            root.refreshConversationPeers()
             if (key === targetId || peerIp === targetIp) {
                 for (let i = 0; i < timeline.count; ++i)
                     if (timeline.get(i).transferId === taskId) return
@@ -315,10 +347,10 @@ ApplicationWindow {
                            : root.copy("设备尚未配对", "Device is not paired"))
             }
         }
-        function onPeerAuthorizationChanged(peerId, ip, allowed) {
+        function onPeerAuthorizationChanged(peerId, ip, mediaToken, allowed) {
             if (!ip) return
-            if (allowed) calls.allowPeer(ip)
-            else calls.revokePeer(ip)
+            if (allowed) calls.allowPeer(peerId, ip, mediaToken)
+            else calls.revokePeer(peerId, ip)
         }
     }
     Connections {
@@ -549,7 +581,7 @@ ApplicationWindow {
             }
             ListView {
                 Layout.fillWidth: true; Layout.fillHeight: true; clip: true; spacing: 5
-                model: discovery.deviceList
+                model: root.conversationPeers
                 Label {
                     anchors.centerIn: parent; visible: parent.count === 0; width: parent.width - 24
                     text: t("noPeers") + "\n" + t("sameWifi"); wrapMode: Text.Wrap
@@ -561,19 +593,19 @@ ApplicationWindow {
                     width: ListView.view.width; height: 58
                     visible: peerSearch.text === "" || modelData.name.toLowerCase().indexOf(peerSearch.text.toLowerCase()) >= 0
                     onClicked: root.openPeer(modelData)
-                    background: Rectangle { radius: 8; color: targetIp === peer.modelData.ip ? root.cyan : peer.hovered ? "#103E6B" : "transparent" }
+                    background: Rectangle { radius: 8; color: targetId === peer.modelData.id ? root.cyan : peer.hovered ? "#103E6B" : "transparent" }
                     contentItem: RowLayout {
                         spacing: 10
-                        Text { text: "computer"; font.family: root.iconFamily; font.pixelSize: 22; color: targetIp === peer.modelData.ip ? root.navy : "#A9D5F3" }
+                        Text { text: peer.modelData.online ? "computer" : "history"; font.family: root.iconFamily; font.pixelSize: 22; color: targetId === peer.modelData.id ? root.navy : "#A9D5F3" }
                         ColumnLayout {
                             Layout.fillWidth: true; spacing: 1
-                            Label { text: peer.modelData.name; color: targetIp === peer.modelData.ip ? root.navy : "#E7F5FD"; font.pixelSize: 13; font.weight: Font.DemiBold; elide: Text.ElideRight; Layout.fillWidth: true }
+                            Label { text: peer.modelData.name; color: targetId === peer.modelData.id ? root.navy : "#E7F5FD"; font.pixelSize: 13; font.weight: Font.DemiBold; elide: Text.ElideRight; Layout.fillWidth: true }
                             Label {
-                                text: { const dependency = root.pairingRevision; return peer.modelData.ip + (transfer.isPaired(peer.modelData.id) ? root.copy(" · 已配对", " · Paired") : "") }
-                                color: targetIp === peer.modelData.ip ? "#24647A" : "#8CB9D5"; font.pixelSize: 10
+                                text: { const dependency = root.pairingRevision; return peer.modelData.online ? peer.modelData.ip + (transfer.isPaired(peer.modelData.id) ? root.copy(" · 已配对", " · Paired") : root.copy(" · 未配对", " · Unpaired")) : root.copy("本地历史", "Local history") }
+                                color: targetId === peer.modelData.id ? "#24647A" : "#8CB9D5"; font.pixelSize: 10
                             }
                         }
-                        Rectangle { Layout.preferredWidth: 6; Layout.preferredHeight: 6; radius: 3; color: targetIp === peer.modelData.ip ? root.navy : root.cyan }
+                        Rectangle { Layout.preferredWidth: 6; Layout.preferredHeight: 6; radius: 3; color: peer.modelData.online ? (targetId === peer.modelData.id ? root.navy : root.cyan) : "#6D8497" }
                     }
                 }
             }
@@ -618,7 +650,12 @@ ApplicationWindow {
             Label { text: t("deviceName"); color: root.ink; font.weight: Font.DemiBold }
             SettingsField { Layout.fillWidth: true; text: app.deviceName; onEditingFinished: app.deviceName = text }
             Label { text: t("language"); color: root.ink; font.weight: Font.DemiBold }
-            SettingsComboBox { Layout.fillWidth: true; model: ["简体中文", "English"]; currentIndex: app.language.indexOf("zh") === 0 ? 0 : 1; onActivated: app.language = currentIndex === 0 ? "zh_CN" : "en_US" }
+            SettingsComboBox {
+                Layout.fillWidth: true
+                model: [root.copy("跟随系统", "System default"), "简体中文", "English"]
+                currentIndex: app.language === "system" ? 0 : app.language === "zh_CN" ? 1 : 2
+                onActivated: app.language = currentIndex === 0 ? "system" : currentIndex === 1 ? "zh_CN" : "en_US"
+            }
             Label { text: t("downloads"); color: root.ink; font.weight: Font.DemiBold }
             RowLayout {
                 Layout.fillWidth: true; spacing: 8
@@ -636,6 +673,32 @@ ApplicationWindow {
             }
             SettingsSwitch { visible: !isMobile; text: t("minimizeToTray"); checked: app.minimizeToTray; onToggled: app.minimizeToTray = checked }
             SettingsSwitch { visible: isMobile; text: t("keepAwake"); checked: app.keepAwake; onToggled: app.keepAwake = checked }
+            Label { visible: isMobile; text: root.copy("音视频权限", "Media permissions"); color: root.ink; font.weight: Font.DemiBold }
+            Rectangle {
+                visible: isMobile; Layout.fillWidth: true; Layout.preferredHeight: 128
+                radius: 10; color: "#F7FAFC"; border.color: root.line
+                ColumnLayout {
+                    anchors.fill: parent; anchors.margins: 12; spacing: 8
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text { text: "videocam"; font.family: root.iconFamily; font.pixelSize: 19; color: root.cyanDark }
+                        Label { Layout.fillWidth: true; text: root.copy("摄像头", "Camera"); color: root.ink }
+                        Label { text: calls.cameraPermissionGranted ? root.copy("已授权", "Allowed") : root.copy("未授权", "Not allowed"); color: calls.cameraPermissionGranted ? root.cyanDark : root.muted; font.pixelSize: 11 }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text { text: "mic"; font.family: root.iconFamily; font.pixelSize: 19; color: root.cyanDark }
+                        Label { Layout.fillWidth: true; text: root.copy("麦克风", "Microphone"); color: root.ink }
+                        Label { text: calls.microphonePermissionGranted ? root.copy("已授权", "Allowed") : root.copy("未授权", "Not allowed"); color: calls.microphonePermissionGranted ? root.cyanDark : root.muted; font.pixelSize: 11 }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; spacing: 8
+                        ModernButton { Layout.fillWidth: true; text: root.copy("请求权限", "Request"); onClicked: calls.requestMediaPermissions() }
+                        ModernButton { Layout.fillWidth: true; text: root.copy("系统设置", "System settings"); onClicked: calls.openApplicationSettings() }
+                    }
+                }
+            }
+            Label { visible: isMobile; Layout.fillWidth: true; wrapMode: Text.Wrap; text: root.copy("屏幕共享启动时还会显示 Android 系统确认窗口。", "Android also confirms each screen-sharing session."); color: root.muted; font.pixelSize: 10 }
             Label { text: root.copy("可信设备", "Trusted devices"); color: root.ink; font.weight: Font.DemiBold }
             ModernButton {
                 Layout.fillWidth: true; glyph: "devices"
@@ -681,18 +744,18 @@ ApplicationWindow {
                 RowLayout {
                     anchors.fill: parent; anchors.leftMargin: compact ? 6 : 26; anchors.rightMargin: compact ? 6 : 18; spacing: compact ? 2 : 9
                     IconAction { visible: compact; diameter: 36; glyph: "menu"; onClicked: deviceDrawer.open() }
-                    Text { visible: !compact; text: targetIp ? "computer" : "devices"; font.family: root.iconFamily; font.pixelSize: 25; color: targetIp ? root.ink : "#9DAEBB" }
+                    Text { visible: !compact; text: targetId ? (targetIp ? "computer" : "history") : "devices"; font.family: root.iconFamily; font.pixelSize: 25; color: targetId ? root.ink : "#9DAEBB" }
                     ColumnLayout {
                         Layout.fillWidth: true; Layout.minimumWidth: 0; spacing: 0
-                        Label { text: targetIp ? targetName : t("selectPeer"); color: root.ink; font.pixelSize: 15; font.weight: Font.DemiBold; elide: Text.ElideRight; Layout.fillWidth: true; Layout.minimumWidth: 0 }
+                        Label { text: targetId ? targetName : t("selectPeer"); color: root.ink; font.pixelSize: 15; font.weight: Font.DemiBold; elide: Text.ElideRight; Layout.fillWidth: true; Layout.minimumWidth: 0 }
                         RowLayout {
-                            visible: targetIp !== ""; spacing: 6; Layout.fillWidth: true; Layout.minimumWidth: 0
-                            Rectangle { Layout.preferredWidth: 6; Layout.preferredHeight: 6; radius: 3; color: root.cyanDark }
-                            Label { Layout.fillWidth: true; Layout.minimumWidth: 0; elide: Text.ElideRight; text: (root.targetReady() ? root.copy("已配对 · 长连接", "Paired · Persistent") : root.copy("连接已断开", "Disconnected")) + " · " + targetIp; color: root.muted; font.pixelSize: 10 }
+                            visible: targetId !== ""; spacing: 6; Layout.fillWidth: true; Layout.minimumWidth: 0
+                            Rectangle { Layout.preferredWidth: 6; Layout.preferredHeight: 6; radius: 3; color: root.targetReady() ? root.cyanDark : "#8193A2" }
+                            Label { Layout.fillWidth: true; Layout.minimumWidth: 0; elide: Text.ElideRight; text: root.targetReady() ? root.copy("已配对 · 长连接", "Paired · Persistent") + " · " + targetIp : targetIp ? root.copy("未配对，可查看本地历史", "Unpaired · Local history available") : root.copy("离线 · 本地历史", "Offline · Local history"); color: root.muted; font.pixelSize: 10 }
                         }
                     }
-                    IconAction { diameter: compact ? 36 : 40; enabled: root.targetReady() && targetMediaPort > 0; glyph: "videocam"; tip: t("video"); onClicked: calls.startCall(targetIp, targetMediaPort, "camera") }
-                    IconAction { diameter: compact ? 36 : 40; enabled: root.targetReady() && targetMediaPort > 0; glyph: "screen_share"; tip: t("screen"); onClicked: calls.startCall(targetIp, targetMediaPort, "screen") }
+                    IconAction { diameter: compact ? 36 : 40; enabled: root.targetReady() && targetMediaPort > 0; glyph: "videocam"; tip: t("video"); onClicked: calls.startCall(targetId, targetIp, targetMediaPort, "camera") }
+                    IconAction { diameter: compact ? 36 : 40; enabled: root.targetReady() && targetMediaPort > 0; glyph: "screen_share"; tip: t("screen"); onClicked: calls.startCall(targetId, targetIp, targetMediaPort, "screen") }
                     IconAction { diameter: compact ? 36 : 40; visible: targetId !== ""; glyph: "delete_sweep"; tip: t("clear"); onClicked: root.clearCurrentConversation() }
                     IconAction {
                         diameter: compact ? 36 : 40; glyph: "more_horiz"; tip: root.copy("更多", "More"); onClicked: conversationMenu.open()
@@ -717,9 +780,9 @@ ApplicationWindow {
                     ColumnLayout {
                         anchors.fill: parent; spacing: 10
                         Item { Layout.fillHeight: true }
-                        Rectangle { Layout.alignment: Qt.AlignHCenter; Layout.preferredWidth: 58; Layout.preferredHeight: 58; radius: 18; color: "#E5F6FA"; Text { anchors.centerIn: parent; text: targetIp ? "forum" : "devices"; font.family: root.iconFamily; font.pixelSize: 29; color: root.cyanDark } }
-                        Label { Layout.alignment: Qt.AlignHCenter; text: targetIp ? root.copy("开始会话", "Start a conversation") : root.copy("选择附近设备", "Choose a nearby device"); color: root.ink; font.pixelSize: 18; font.weight: Font.DemiBold }
-                        Label { Layout.alignment: Qt.AlignHCenter; Layout.maximumWidth: 360; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap; text: targetIp ? root.copy("消息和文件共享同一条时间线，传输可断点续传并自动校验。", "Messages and files share one timeline with resume and verification.") : t("sameWifi"); color: root.muted; font.pixelSize: 12 }
+                        Rectangle { Layout.alignment: Qt.AlignHCenter; Layout.preferredWidth: 58; Layout.preferredHeight: 58; radius: 18; color: "#E5F6FA"; Text { anchors.centerIn: parent; text: targetId ? "forum" : "devices"; font.family: root.iconFamily; font.pixelSize: 29; color: root.cyanDark } }
+                        Label { Layout.alignment: Qt.AlignHCenter; text: targetId ? root.copy("暂无历史消息", "No message history") : root.copy("选择附近设备", "Choose a nearby device"); color: root.ink; font.pixelSize: 18; font.weight: Font.DemiBold }
+                        Label { Layout.alignment: Qt.AlignHCenter; Layout.maximumWidth: 360; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap; text: targetId ? (targetIp ? root.copy("完成配对后即可继续发送消息和文件。", "Pair to send new messages and files.") : root.copy("设备离线时仍可查看和清理本地历史。", "Local history remains available while the device is offline.")) : t("sameWifi"); color: root.muted; font.pixelSize: 12 }
                         Item { Layout.fillHeight: true }
                     }
                 }
@@ -732,6 +795,7 @@ ApplicationWindow {
                     required property double fileSize
                     required property string status
                     required property string checksum
+                    required property string transferId
                     required property real progress
                     required property double createdAt
                     width: chat.width - chat.leftMargin - chat.rightMargin
@@ -787,6 +851,14 @@ ApplicationWindow {
                                     text: root.copy("打开文件夹", "Open folder"); color: root.cyanDark; font.pixelSize: 11; font.weight: Font.DemiBold
                                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: transfer.openFolder() }
                                 }
+                                IconAction {
+                                    visible: msg.kind === "file" && msg.transferId !== ""
+                                             && ["connecting", "negotiating", "transferring", "receiving",
+                                                 "resuming", "verifying", "paused", "retrying"].indexOf(msg.status) >= 0
+                                    diameter: 26; glyph: "close"
+                                    tip: root.copy("取消传输", "Cancel transfer")
+                                    onClicked: transfer.cancelTransfer(msg.transferId)
+                                }
                             }
                         }
                     }
@@ -799,7 +871,10 @@ ApplicationWindow {
                     border.width: 1; border.color: composer.activeFocus ? root.cyanDark : root.line
                     RowLayout {
                         anchors.fill: parent; anchors.leftMargin: 6; anchors.rightMargin: 6; spacing: 2
-                        IconAction { enabled: root.targetReady(); glyph: "add_circle_outline"; tip: t("file"); onClicked: fileDialog.open() }
+                        IconAction {
+                            enabled: root.targetReady(); glyph: "add_circle_outline"; tip: t("file")
+                            onClicked: isMobile ? app.chooseFiles() : fileDialog.open()
+                        }
                         TextArea {
                             id: composer
                             Layout.fillWidth: true; Layout.fillHeight: true
@@ -813,7 +888,7 @@ ApplicationWindow {
                                 anchors.right: parent.right; anchors.rightMargin: composer.rightPadding
                                 anchors.verticalCenter: parent.verticalCenter
                                 visible: composer.text.length === 0
-                                text: root.targetReady() ? t("message") : targetIp ? root.copy("连接已断开，重新点击设备配对", "Disconnected—tap the device to pair") : t("selectPeer")
+                                text: root.targetReady() ? t("message") : targetId ? (targetIp ? root.copy("完成配对后可继续发送", "Pair to continue sending") : root.copy("设备离线，可查看本地历史", "Device offline · Local history")) : t("selectPeer")
                                 color: root.muted; font.pixelSize: composer.font.pixelSize
                                 elide: Text.ElideRight
                                 verticalAlignment: Text.AlignVCenter

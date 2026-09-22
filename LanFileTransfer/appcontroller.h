@@ -7,12 +7,14 @@
 #include <QVariantList>
 
 class QSystemTrayIcon;
+class QAction;
 
 class AppController : public QObject
 {
     Q_OBJECT
     QML_ELEMENT
     Q_PROPERTY(QString language READ language WRITE setLanguage NOTIFY languageChanged)
+    Q_PROPERTY(QString effectiveLanguage READ effectiveLanguage NOTIFY languageChanged)
     Q_PROPERTY(QString deviceName READ deviceName WRITE setDeviceName NOTIFY deviceNameChanged)
     Q_PROPERTY(QString downloadDirectory READ downloadDirectory WRITE setDownloadDirectory NOTIFY downloadDirectoryChanged)
     Q_PROPERTY(bool minimizeToTray READ minimizeToTray WRITE setMinimizeToTray NOTIFY minimizeToTrayChanged)
@@ -23,6 +25,7 @@ public:
     ~AppController() override;
 
     QString language() const;
+    QString effectiveLanguage() const;
     QString deviceName() const;
     QString downloadDirectory() const;
     bool minimizeToTray() const;
@@ -36,6 +39,7 @@ public:
 
     Q_INVOKABLE QString tr(const QString &key) const;
     Q_INVOKABLE QVariantList messages(const QString &peerKey, int limit = 500) const;
+    Q_INVOKABLE QVariantList recentConversations() const;
     Q_INVOKABLE qint64 addMessage(const QString &peerKey, const QString &peerName,
                                   bool outgoing, const QString &kind, const QString &body,
                                   const QString &fileName = {}, qint64 fileSize = 0,
@@ -47,6 +51,7 @@ public:
     Q_INVOKABLE void showNotification(const QString &title, const QString &message);
     Q_INVOKABLE void copyToClipboard(const QString &text);
     Q_INVOKABLE void moveToBackground();
+    Q_INVOKABLE void chooseFiles();
     Q_INVOKABLE void chooseReceiveDirectory();
     Q_INVOKABLE void hideToTray();
     Q_INVOKABLE void restoreWindow();
@@ -62,6 +67,7 @@ signals:
     void restoreRequested();
     void quitRequested();
     void storageError(const QString &message);
+    void filesSelected(const QVariantList &files);
     void receiveDirectorySelected(const QString &uri);
     void networkEnvironmentChanged();
     void diagnosticBundleReady(const QString &path);
@@ -71,9 +77,12 @@ private:
     void openDatabase();
     void writeSetting(const QString &key, const QVariant &value);
     void configureTray();
+    void updateTrayText();
     void applyAndroidBackgroundMode();
 
     mutable QSqlDatabase m_database;
     QSettings m_settings;
     QSystemTrayIcon *m_tray = nullptr;
+    QAction *m_restoreAction = nullptr;
+    QAction *m_quitAction = nullptr;
 };

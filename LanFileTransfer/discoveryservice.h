@@ -18,10 +18,6 @@
 #include <QUuid>
 #include <QNetworkInterface>
 
-#ifdef Q_OS_ANDROID
-#include <QJniObject>
-#endif
-
 /**
  * @class DiscoveryService
  * @brief 设备发现服务类，负责局域网内对等设备的自动发现与状态维护
@@ -154,7 +150,7 @@ private:
      QString m_deviceName;
 
 #ifdef Q_OS_ANDROID
-    QJniObject m_multicastLock;     ///< Android 组播锁，用于确保能接收 UDP 广播包
+    bool m_multicastAcquired = false; ///< Java 层共享组播锁的使用权
 #endif
 
     /**

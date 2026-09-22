@@ -8,10 +8,32 @@ cmake_minimum_required(VERSION 3.16)
 # 项目基本信息
 # ============================================================================
 # 项目名称：LanFileTransfer
-# 版本：0.1（可通过 project(… VERSION) 自动生成版本宏）
+# 版本：0.1.0（可通过 project(… VERSION) 自动生成版本宏）
 # 使用语言：仅 C++（LANGUAGES CXX 可减少不必要的语言检测，加快配置）
-project(LanFileTransfer VERSION 0.1 LANGUAGES CXX)
+project(LanFileTransfer VERSION 0.1.0 LANGUAGES CXX)
 include(CTest)
+
+# Signing credentials are supplied only through the process environment.  Fail
+# during configuration rather than producing a package that merely looks like
+# a release artifact when one of the four required values is missing.
+if(ANDROID AND (QT_ANDROID_SIGN_APK OR QT_ANDROID_SIGN_AAB))
+    foreach(_landrop_signing_variable IN ITEMS
+            QT_ANDROID_KEYSTORE_PATH
+            QT_ANDROID_KEYSTORE_ALIAS
+            QT_ANDROID_KEYSTORE_STORE_PASS
+            QT_ANDROID_KEYSTORE_KEY_PASS)
+        if(NOT DEFINED ENV{${_landrop_signing_variable}}
+                OR "$ENV{${_landrop_signing_variable}}" STREQUAL "")
+            message(FATAL_ERROR
+                "Android signing is enabled, but ${_landrop_signing_variable} is not set")
+        endif()
+    endforeach()
+    if(NOT EXISTS "$ENV{QT_ANDROID_KEYSTORE_PATH}")
+        message(FATAL_ERROR
+            "QT_ANDROID_KEYSTORE_PATH does not exist: $ENV{QT_ANDROID_KEYSTORE_PATH}")
+    endif()
+    unset(_landrop_signing_variable)
+endif()
 
 # ============================================================================
 # C++ 标准配置
@@ -41,6 +63,12 @@ set(CMAKE_AUTOUIC ON)
 # Quick    - Qt Quick 模块（标准 QML 类型和控件）
 # Network  - 网络功能（TCP/UDP、HTTP、本地发现等）
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick Network Sql Widgets Multimedia Concurrent)
+
+# Qt 6.6 起 Android 路径属性支持生成器表达式。显式采用新行为，避免
+# Android 配置阶段回退到已弃用的兼容模式并输出 QTP0002 警告。
+if(QT_KNOWN_POLICY_QTP0002)
+    qt_policy(SET QTP0002 NEW)
+endif()
 
 # ============================================================================
 # 创建可执行文件并嵌入资源
@@ -105,6 +133,8 @@ target_link_libraries(appLanFileTransfer
         Qt6::Multimedia
         Qt6::Concurrent
 )
+target_compile_definitions(appLanFileTransfer PRIVATE
+    LANDROP_VERSION="${PROJECT_VERSION}")
 
 # ============================================================================
 # Windows 平台配置：隐藏控制台窗口
@@ -114,6 +144,44 @@ target_link_libraries(appLanFileTransfer
 if(WIN32)
     set_target_properties(appLanFileTransfer PROPERTIES WIN32_EXECUTABLE TRUE)
     target_link_libraries(appLanFileTransfer PRIVATE dbghelp)
+
+    # Keep the executable directory self-contained.  Launching the binary from
+    # Qt Creator can hide missing runtime files because the kit prepends Qt to
+    # PATH; Explorer and CTest do not.  Resolve windeployqt from the exact Qt
+    # kit used by this configure step, then deploy Qt/QML plugins and the
+    # matching compiler runtime on every default build.  A POST_BUILD command
+    # alone is insufficient here: it does not run again when the executable is
+    # already up to date but somebody removed a DLL from the run directory.
+    option(LANDROP_DEPLOY_WINDOWS_RUNTIME
+           "Deploy the Windows Qt runtime next to appLanFileTransfer" ON)
+    if(LANDROP_DEPLOY_WINDOWS_RUNTIME)
+        get_target_property(_landrop_qmake_executable Qt6::qmake IMPORTED_LOCATION)
+        get_filename_component(_landrop_qt_bin_dir
+                               "${_landrop_qmake_executable}" DIRECTORY)
+        find_program(LANDROP_WINDEPLOYQT_EXECUTABLE
+                     NAMES windeployqt windeployqt6
+                     HINTS "${_landrop_qt_bin_dir}"
+                     NO_DEFAULT_PATH)
+        if(NOT LANDROP_WINDEPLOYQT_EXECUTABLE)
+            message(FATAL_ERROR
+                    "windeployqt was not found in the selected Qt kit: ${_landrop_qt_bin_dir}")
+        endif()
+
+        add_custom_target(landrop_deploy_windows_runtime ALL
+            COMMAND "${LANDROP_WINDEPLOYQT_EXECUTABLE}"
+                    --compiler-runtime
+                    --qmldir "${CMAKE_CURRENT_SOURCE_DIR}"
+                    --no-translations
+                    --verbose 0
+                    "$<TARGET_FILE:appLanFileTransfer>"
+            COMMAND "${CMAKE_COMMAND}"
+                    "-DLANDROP_DEPLOY_DIRECTORY=$<TARGET_FILE_DIR:appLanFileTransfer>"
+                    "-DLANDROP_MINGW=${MINGW}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/VerifyWindowsDeployment.cmake"
+            DEPENDS appLanFileTransfer
+            COMMENT "Deploying and verifying Qt, QML and compiler runtime files"
+            VERBATIM)
+    endif()
 endif()
 
 # ============================================================================
@@ -122,8 +190,14 @@ endif()
 if(ANDROID)
     # 指定 Android 部署包源目录，该目录下应包含 AndroidManifest.xml、build.gradle 等文件
     # Qt 的 androiddeployqt 工具会使用此目录生成最终 APK
-    set_property(TARGET appLanFileTransfer PROPERTY QT_ANDROID_PACKAGE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/android")
-    set_property(TARGET appLanFileTransfer PROPERTY QT_ANDROID_PACKAGE_NAME "org.landrop.app")
+    set_target_properties(appLanFileTransfer PROPERTIES
+        QT_ANDROID_PACKAGE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/android"
+        QT_ANDROID_PACKAGE_NAME "org.landrop.app"
+        QT_ANDROID_MIN_SDK_VERSION 28
+        QT_ANDROID_TARGET_SDK_VERSION 36
+        QT_ANDROID_VERSION_CODE 1
+        QT_ANDROID_VERSION_NAME "${PROJECT_VERSION}"
+    )
 
     # 强制指定目标 ABI 为 arm64-v8a（适用于现代 64 位 ARM 设备，如骁龙 8 Gen 1）
     # 注意：该变量可能在 Android 工具链中被重新设置，更可靠的方式是使用 CMAKE_ANDROID_ARCH_ABI
@@ -169,4 +243,23 @@ if(BUILD_TESTING AND NOT ANDROID)
         target_link_libraries(diagnosticlog_test PRIVATE dbghelp)
     endif()
     add_test(NAME diagnosticlog_test COMMAND diagnosticlog_test)
+
+    add_executable(callmanager_integration_test
+        tests/callmanager_integration_test.cpp
+        callmanager.h callmanager.cpp
+    )
+    target_include_directories(callmanager_integration_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(callmanager_integration_test PRIVATE
+        Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::Network Qt6::Multimedia)
+    add_test(NAME callmanager_integration_test COMMAND callmanager_integration_test)
+    set_tests_properties(callmanager_integration_test PROPERTIES TIMEOUT 20)
+
+    if(WIN32)
+        add_test(NAME application_qml_smoke_test
+                 COMMAND appLanFileTransfer --smoke-test)
+        add_test(NAME call_ui_qml_smoke_test
+                 COMMAND appLanFileTransfer --smoke-test --call-preview)
+        set_tests_properties(application_qml_smoke_test call_ui_qml_smoke_test
+                             PROPERTIES TIMEOUT 15 RUN_SERIAL TRUE)
+    endif()
 endif()

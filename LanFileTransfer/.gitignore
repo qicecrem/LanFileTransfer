@@ -2,6 +2,7 @@
 /build/
 /build-*/
 /out/
+/dist/
 /cmake-build-*/
 /CMakeFiles/
 /CMakeCache.txt

@@ -5,7 +5,7 @@
 #include <QImage>
 #include <QQuickImageProvider>
 #include <QMutex>
-#include <QSet>
+#include <QHash>
 
 class QCamera;
 class QAudioSink;
@@ -40,6 +40,8 @@ class CallManager : public QObject
     Q_PROPERTY(int remoteFrameRevision READ remoteFrameRevision NOTIFY remoteFrameChanged)
     Q_PROPERTY(bool audioMuted READ audioMuted WRITE setAudioMuted NOTIFY controlsChanged)
     Q_PROPERTY(bool videoMuted READ videoMuted WRITE setVideoMuted NOTIFY controlsChanged)
+    Q_PROPERTY(bool cameraPermissionGranted READ cameraPermissionGranted NOTIFY permissionsChanged)
+    Q_PROPERTY(bool microphonePermissionGranted READ microphonePermissionGranted NOTIFY permissionsChanged)
 
 public:
     explicit CallManager(QObject *parent = nullptr);
@@ -52,17 +54,24 @@ public:
     int remoteFrameRevision() const { return m_remoteRevision; }
     bool audioMuted() const { return m_audioMuted; }
     bool videoMuted() const { return m_videoMuted; }
+    bool cameraPermissionGranted() const;
+    bool microphonePermissionGranted() const;
     void setAudioMuted(bool muted);
     void setVideoMuted(bool muted);
 
-    Q_INVOKABLE void startCall(const QString &ip, quint16 port, const QString &mode);
+    Q_INVOKABLE void startCall(const QString &peerId, const QString &ip, quint16 port,
+                               const QString &mode);
     Q_INVOKABLE void acceptCall();
     Q_INVOKABLE void rejectCall();
     Q_INVOKABLE void hangup();
     Q_INVOKABLE void switchMode(const QString &mode);
     Q_INVOKABLE void startLocalDiagnostic(const QString &mode);
-    Q_INVOKABLE void allowPeer(const QString &ip);
-    Q_INVOKABLE void revokePeer(const QString &ip);
+    Q_INVOKABLE void allowPeer(const QString &peerId, const QString &ip,
+                               const QString &mediaToken);
+    Q_INVOKABLE void revokePeer(const QString &peerId, const QString &ip);
+    Q_INVOKABLE void requestMediaPermissions();
+    Q_INVOKABLE void openApplicationSettings();
+    Q_INVOKABLE void refreshPermissions();
 
 signals:
     void stateChanged();
@@ -71,15 +80,33 @@ signals:
     void remoteFrameChanged();
     void callError(const QString &message);
     void controlsChanged();
+    void permissionsChanged();
 
 private:
-    enum PacketType : quint8 { Invite=1, Accept=2, Reject=3, Hangup=4, VideoFrame=5, SwitchMode=6, AudioFrame=7 };
-    void attachSocket(QTcpSocket *socket);
+    friend class CallManagerIntegrationTest;
+    enum PacketType : quint8 { Invite=1, Accept=2, Reject=3, Hangup=4, VideoFrame=5,
+                               SwitchMode=6, AudioFrame=7, AuthHello=8, AuthChallenge=9 };
+    enum class HandshakeStage { None, AwaitingChallenge, AwaitingInvite,
+                                AwaitingDecision, AwaitingResponse, Authenticated };
+    struct AuthorizedPeer {
+        QString ip;
+        QByteArray key;
+    };
+    void attachSocket(QTcpSocket *socket, bool outgoing);
     void sendPacket(PacketType type, const QByteArray &payload = {});
     void processPackets();
     void startCapture();
     void stopCapture();
+    void endCall(bool notifyPeer);
+    void resetFrames();
+    void checkConnectionHealth();
+    bool ensurePermissionsForMode(const QString &mode);
     void setState(const QString &state);
+    void clearActiveAuthentication();
+    static QByteArray authenticationProof(const QByteArray &key, const QByteArray &label,
+                                          const QByteArray &challenge, const QString &mode);
+    QByteArray replyPayload(PacketType type) const;
+    bool verifyReply(PacketType type, const QByteArray &payload) const;
 
     static CallFrameProvider *s_provider;
     QTcpServer *m_server = nullptr;
@@ -93,15 +120,20 @@ private:
     QIODevice *m_audioInput = nullptr;
     QIODevice *m_audioOutput = nullptr;
     QByteArray m_buffer;
+    QByteArray m_activeAuthKey;
+    QByteArray m_authChallenge;
+    QString m_peerId;
     QString m_peerIp;
     QString m_state = "idle";
     QString m_mode = "camera";
     int m_localRevision = 0;
     int m_remoteRevision = 0;
     qint64 m_lastFrameAt = 0;
+    qint64 m_lastInboundAt = 0;
     bool m_audioMuted = false;
     bool m_videoMuted = false;
-    QSet<QString> m_allowedPeers;
+    QHash<QString,AuthorizedPeer> m_allowedPeers;
+    HandshakeStage m_handshakeStage = HandshakeStage::None;
     bool m_loggedFirstLocalFrame = false;
     bool m_loggedFirstRemoteFrame = false;
     quint64 m_localFrameCount = 0;

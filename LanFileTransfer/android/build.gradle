@@ -6,7 +6,8 @@ buildscript {
 
     dependencies {
         //noinspection AndroidGradlePluginVersion
-        classpath 'com.android.tools.build:gradle:8.6.0'
+        // API 36 requires Android Gradle Plugin 8.9.1 or newer.
+        classpath 'com.android.tools.build:gradle:8.9.1'
     }
 }
 
@@ -152,6 +153,7 @@ android {
 
     tasks.withType(JavaCompile) {
         options.incremental = true
+        options.compilerArgs += ['-Xlint:deprecation']
     }
 
     compileOptions {

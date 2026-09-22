@@ -15,9 +15,9 @@
 
 struct TransferContext {
     QString id, peerIp, fileName, finalPath, partialPath, sourcePath;
-    QByteArray checksum;
+    QByteArray checksum, authKey, authChallenge;
     bool isSender=false, offerAccepted=false, completionSent=false, sourceEof=false;
-    bool isControl=false, paired=false;
+    bool isControl=false, paired=false, verificationInProgress=false, reconnecting=false;
     QString peerId, peerName;
     quint16 peerPort=0;
     qint64 lastActivityMs=0;
@@ -82,12 +82,13 @@ signals:
     void pairingRequested(QString peerId,QString peerName,QString ip);
     // Canonical values: unpaired, pairing, online, reconnecting, offline.
     void pairingStateChanged(QString peerId,QString state);
-    void peerAuthorizationChanged(QString peerId,QString ip,bool allowed);
+    void peerAuthorizationChanged(QString peerId,QString ip,QString mediaToken,bool allowed);
     void trustedPeersChanged();
 private:
     friend class TransferManagerIntegrationTest;
     void onNewConnection();
     void onReadyRead(QTcpSocket *socket);
+    void sweepSockets();
     void sendPacket(QTcpSocket *socket,MessageType type,const std::function<void(QDataStream&)> &writer={});
     void sendNextChunk(QTcpSocket *socket);
     void beginOutgoingTransfer(PersistedTransfer transfer,bool validateSource);
@@ -103,6 +104,7 @@ private:
     struct PeerConnection {
         QString name;
         QString ip;
+        QByteArray authKey;
         quint16 port=0;
         qint64 lastSeen=0;
         bool trusted=false;
@@ -121,6 +123,18 @@ private:
                                quint16 port,bool reconnecting);
     bool establishSession(QTcpSocket *socket,TransferContext *context);
     void scheduleReconnect(const QString &peerId);
+    static QByteArray controlRequestProof(const QByteArray &key,const QString &senderId,
+                                          const QString &recipientId,bool reconnecting,
+                                          const QByteArray &challenge);
+    static QByteArray controlAcceptProof(const QByteArray &key,const QString &senderId,
+                                         const QString &recipientId,
+                                         const QByteArray &requestChallenge,
+                                         const QByteArray &responseChallenge);
+    static QByteArray fileOfferProof(const QByteArray &key,const QString &senderId,
+                                     const QString &recipientId,const QByteArray &challenge,
+                                     const QString &transferId,const QString &fileName,
+                                     qint64 totalBytes,const QByteArray &checksum);
+    static QByteArray mediaAuthorizationKey(const QByteArray &key);
     QString m_saveDirectory;
     QTcpServer *m_server=nullptr;
     QMap<QTcpSocket*,TransferContext*> m_tasks;
@@ -134,6 +148,7 @@ private:
     QSet<QString> m_activeTransferIds;
     QSet<QString> m_cancelledTransferIds;
     QHash<QString,int> m_transferRetryAttempts;
+    QHash<QString,int> m_checksumRetryAttempts;
     TransferStore m_transferStore;
     bool m_transfersRestored=false;
     QString m_localId;

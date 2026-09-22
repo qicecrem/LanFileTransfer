@@ -1,11 +1,10 @@
 package org.landrop.app;
 
-import android.app.Activity;
+import android.app.DownloadManager;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
-import android.os.Build;
 import android.provider.DocumentsContract;
 
 import java.io.File;
@@ -64,14 +63,24 @@ public final class StorageBridge {
 
     public static void openDirectory(Context context, String value) {
         try {
-            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+            Uri tree = Uri.parse(value);
+            Uri document = DocumentsContract.buildDocumentUriUsingTree(
+                    tree, DocumentsContract.getTreeDocumentId(tree));
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setDataAndType(document, DocumentsContract.Document.MIME_TYPE_DIR);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK |
                     Intent.FLAG_GRANT_READ_URI_PERMISSION |
-                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
-                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-            if (Build.VERSION.SDK_INT >= 26)
-                intent.putExtra("android.provider.extra.INITIAL_URI", Uri.parse(value));
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
             context.startActivity(intent);
-        } catch (RuntimeException ignored) { }
+        } catch (RuntimeException ignored) {
+            // Some vendor file managers do not advertise directory MIME support.
+            // Open their regular downloads browser instead of showing the SAF
+            // authorization picker again.
+            try {
+                Intent fallback = new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS);
+                fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                context.startActivity(fallback);
+            } catch (RuntimeException ignoredFallback) { }
+        }
     }
 }

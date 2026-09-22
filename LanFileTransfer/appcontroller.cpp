@@ -12,8 +12,10 @@
 #include <QStandardPaths>
 #include <QSystemTrayIcon>
 #include <QPointer>
+#include <QSet>
 #include <QDesktopServices>
 #include <QFileInfo>
+#include <QLocale>
 #include <QUrl>
 
 #ifdef Q_OS_ANDROID
@@ -51,7 +53,18 @@ AppController::~AppController()
     QSqlDatabase::removeDatabase("landrop-history");
 }
 
-QString AppController::language() const { return m_settings.value("ui/language", "zh_CN").toString(); }
+QString AppController::language() const
+{
+    const QString value = m_settings.value("ui/language", "system").toString();
+    return value == QStringLiteral("zh_CN") || value == QStringLiteral("en_US")
+        ? value : QStringLiteral("system");
+}
+QString AppController::effectiveLanguage() const
+{
+    if (language() != QStringLiteral("system")) return language();
+    return QLocale::system().name().startsWith(QStringLiteral("zh"), Qt::CaseInsensitive)
+        ? QStringLiteral("zh_CN") : QStringLiteral("en_US");
+}
 QString AppController::deviceName() const
 {
     const QString fallback = QHostInfo::localHostName().isEmpty() ? QStringLiteral("LanDrop") : QHostInfo::localHostName();
@@ -76,7 +89,15 @@ void AppController::writeSetting(const QString &key, const QVariant &value)
     m_settings.setValue(key, value);
     m_settings.sync();
 }
-void AppController::setLanguage(const QString &v) { if (v == language()) return; writeSetting("ui/language", v); emit languageChanged(); }
+void AppController::setLanguage(const QString &v)
+{
+    const QString normalized = v == QStringLiteral("zh_CN") || v == QStringLiteral("en_US")
+        ? v : QStringLiteral("system");
+    if (normalized == language()) return;
+    writeSetting("ui/language", normalized);
+    emit languageChanged();
+    updateTrayText();
+}
 void AppController::setDeviceName(const QString &v) { const auto s=v.trimmed(); if (s.isEmpty()||s==deviceName()) return; writeSetting("identity/deviceName",s); emit deviceNameChanged(); }
 void AppController::setDownloadDirectory(const QString &v) { if (v.isEmpty()||v==downloadDirectory()) return; writeSetting("transfer/downloadDirectory",v); emit downloadDirectoryChanged(); }
 void AppController::setMinimizeToTray(bool v) { if(v==minimizeToTray()) return; writeSetting("desktop/minimizeToTray",v); emit minimizeToTrayChanged(); }
@@ -103,7 +124,7 @@ QString AppController::tr(const QString &key) const
     };
     const auto it = words.constFind(key);
     if (it == words.constEnd()) return key;
-    return it.value().at(language().startsWith("zh") ? 0 : 1);
+    return it.value().at(effectiveLanguage().startsWith("zh") ? 0 : 1);
 }
 
 void AppController::openDatabase()
@@ -134,6 +155,30 @@ QVariantList AppController::messages(const QString &peerKey, int limit) const
     q.addBindValue(peerKey); q.addBindValue(qBound(1,limit,2000));
     if (!q.exec()) return result;
     while(q.next()) result.prepend(rowToMessage(q));
+    return result;
+}
+
+QVariantList AppController::recentConversations() const
+{
+    QVariantList result;
+    if (!m_database.isOpen()) return result;
+    QSqlQuery q(m_database);
+    if (!q.exec("SELECT peer_key,peer_name,kind,body,file_name,created_at "
+                "FROM messages ORDER BY created_at DESC"))
+        return result;
+    QSet<QString> seen;
+    while (q.next()) {
+        const QString peerKey = q.value(0).toString();
+        if (peerKey.isEmpty() || seen.contains(peerKey)) continue;
+        seen.insert(peerKey);
+        QString name = q.value(1).toString().trimmed();
+        if (name.isEmpty()) name = peerKey;
+        const QString preview = q.value(2).toString() == QStringLiteral("file")
+                ? q.value(4).toString() : q.value(3).toString();
+        result.append(QVariantMap{{"id", peerKey}, {"name", name}, {"ip", QString{}},
+                                  {"port", 0}, {"mediaPort", 0}, {"online", false},
+                                  {"lastMessage", preview}, {"lastSeen", q.value(5)}});
+    }
     return result;
 }
 
@@ -180,12 +225,22 @@ void AppController::configureTray()
     if (!QSystemTrayIcon::isSystemTrayAvailable()) return;
     m_tray = new QSystemTrayIcon(QIcon(":/logo.png"), this);
     auto *menu = new QMenu;
-    menu->addAction(tr("appName"), this, &AppController::restoreWindow);
+    m_restoreAction = menu->addAction(QString{}, this, &AppController::restoreWindow);
     menu->addSeparator();
-    menu->addAction(language().startsWith("zh") ? "退出" : "Quit", this, &AppController::quitRequested);
+    m_quitAction = menu->addAction(QString{}, this, &AppController::quitRequested);
     m_tray->setContextMenu(menu);
+    updateTrayText();
     connect(m_tray, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason r){ if(r==QSystemTrayIcon::Trigger||r==QSystemTrayIcon::DoubleClick) restoreWindow(); });
     m_tray->show();
+#endif
+}
+void AppController::updateTrayText()
+{
+#ifndef Q_OS_ANDROID
+    if (m_restoreAction) m_restoreAction->setText(tr(QStringLiteral("appName")));
+    if (m_quitAction) m_quitAction->setText(
+        effectiveLanguage().startsWith(QStringLiteral("zh")) ? QStringLiteral("退出")
+                                                              : QStringLiteral("Quit"));
 #endif
 }
 void AppController::showNotification(const QString &title,const QString &message) {
@@ -215,6 +270,13 @@ void AppController::moveToBackground()
         activity.callMethod<jboolean>("moveTaskToBack", "(Z)Z", true);
 #endif
 }
+void AppController::chooseFiles()
+{
+#ifdef Q_OS_ANDROID
+    const QJniObject activity = QNativeInterface::QAndroidApplication::context();
+    if (activity.isValid()) activity.callMethod<void>("requestFiles", "()V");
+#endif
+}
 void AppController::chooseReceiveDirectory()
 {
 #ifdef Q_OS_ANDROID
@@ -222,7 +284,7 @@ void AppController::chooseReceiveDirectory()
     if (activity.isValid()) activity.callMethod<void>("requestReceiveDirectory", "()V");
 #endif
 }
-void AppController::hideToTray() { if(m_tray) m_tray->showMessage(tr("appName"), language().startsWith("zh")?"仍在后台接收文件":"Still receiving in the background",QSystemTrayIcon::Information,2500); }
+void AppController::hideToTray() { if(m_tray) m_tray->showMessage(tr(QStringLiteral("appName")), effectiveLanguage().startsWith("zh")?"仍在后台接收文件":"Still receiving in the background",QSystemTrayIcon::Information,2500); }
 void AppController::restoreWindow() { emit restoreRequested(); }
 QString AppController::diagnosticLogPath() const { return DiagnosticLog::path(); }
 
@@ -265,6 +327,26 @@ void AppController::applyAndroidBackgroundMode()
 }
 
 #ifdef Q_OS_ANDROID
+extern "C" Q_DECL_EXPORT void JNICALL
+Java_org_landrop_app_LanTransferActivity_nativeFilesSelected(
+    JNIEnv *environment, jobject, jobjectArray values)
+{
+    if (!androidController || !values) return;
+    QVariantList files;
+    const jsize count = environment->GetArrayLength(values);
+    files.reserve(count);
+    for (jsize index = 0; index < count; ++index) {
+        auto value = static_cast<jstring>(environment->GetObjectArrayElement(values, index));
+        if (!value) continue;
+        const QString uri = QJniObject::fromLocalRef(value).toString();
+        if (!uri.isEmpty()) files.append(QUrl(uri));
+    }
+    if (files.isEmpty()) return;
+    QMetaObject::invokeMethod(androidController, [files] {
+        if (androidController) emit androidController->filesSelected(files);
+    }, Qt::QueuedConnection);
+}
+
 extern "C" Q_DECL_EXPORT void JNICALL
 Java_org_landrop_app_LanTransferActivity_nativeReceiveDirectorySelected(
     JNIEnv *, jobject, jstring value)

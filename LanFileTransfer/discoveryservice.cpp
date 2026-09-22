@@ -129,27 +129,15 @@ void DiscoveryService::startScan()
     qDebug() << "开始 UDP 局域网扫描，广播端口:" << DISCOVERY_PORT;
 
 #ifdef Q_OS_ANDROID
-    // Android 平台需要获取 MulticastLock 才能接收广播包
-    QJniObject context = QNativeInterface::QAndroidApplication::context();
+    // Android 平台需要 MulticastLock 才能稳定接收组播。锁由 Java
+    // 服务集中管理，避免扫描器和前台服务重复创建底层锁对象。
+    const QJniObject context = QNativeInterface::QAndroidApplication::context();
     if (context.isValid()) {
-        QJniObject serviceName = QJniObject::fromString("wifi");
-        QJniObject wifiManager = context.callMethod<QJniObject>(
-            "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", serviceName.object());
-
-        if (wifiManager.isValid()) {
-            QJniObject lock = wifiManager.callMethod<QJniObject>(
-                "createMulticastLock", "(Ljava/lang/String;)Landroid/net/wifi/WifiManager$MulticastLock;",
-                QJniObject::fromString("LanFileTransferLock").object());
-            if (lock.isValid()) {
-                m_multicastLock = lock;          // 保存锁对象供后续释放
-                m_multicastLock.callMethod<void>("acquire");
-                qDebug() << "Android 组播锁已获取";
-            } else {
-                qWarning() << "创建 Android 组播锁失败";
-            }
-        } else {
-            qWarning() << "获取 Android WifiManager 失败";
-        }
+        m_multicastAcquired = QJniObject::callStaticMethod<jboolean>(
+            "org/landrop/app/LanTransferService", "acquireMulticast",
+            "(Landroid/content/Context;)Z", context.object());
+        if (m_multicastAcquired) qDebug() << "Android 共享组播锁已获取";
+        else qWarning() << "获取 Android 共享组播锁失败";
     } else {
         qWarning() << "获取 Android Activity 失败";
     }
@@ -196,13 +184,11 @@ void DiscoveryService::stopScan()
     emit deviceListChanged();
 
 #ifdef Q_OS_ANDROID
-    if (m_multicastLock.isValid()) {
-        // 使用 QNativeInterface 判断 JNI 环境是否还活着
-        if (QNativeInterface::QAndroidApplication::context().isValid()) {
-            m_multicastLock.callMethod<void>("release");
-            qDebug() << "Android 组播锁已释放";
-        }
-        m_multicastLock = nullptr; // 置空
+    if (m_multicastAcquired) {
+        QJniObject::callStaticMethod<void>("org/landrop/app/LanTransferService",
+                                           "releaseMulticast", "()V");
+        m_multicastAcquired = false;
+        qDebug() << "Android 共享组播锁使用权已释放";
     }
 #endif
 }

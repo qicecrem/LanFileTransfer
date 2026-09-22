@@ -9,9 +9,12 @@
 #include <QFileInfo>
 #include <QFutureWatcher>
 #include <QHostInfo>
+#include <QMessageAuthenticationCode>
 #include <QPointer>
+#include <QRandomGenerator>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QStorageInfo>
 #include <QTimer>
 #include <QUuid>
 #include <QtConcurrent/QtConcurrentRun>
@@ -28,11 +31,53 @@ constexpr quint32 MaxPacketSize = 4 * 1024 * 1024;
 constexpr qsizetype MaxDataChunkSize = 512 * 1024;
 constexpr qsizetype MaxTextLength = 64 * 1024;
 constexpr qint64 SessionTimeoutMs = 45000;
+constexpr qint64 ConnectionTimeoutMs = 15000;
+constexpr qint64 IncomingHandshakeTimeoutMs = 15000;
+constexpr qint64 PairingDecisionTimeoutMs = 120000;
+constexpr qint64 TransferIdleTimeoutMs = 90000;
+constexpr qint64 VerificationTimeoutMs = 10 * 60 * 1000;
+constexpr qint64 StorageReserveBytes = 16 * 1024 * 1024;
+constexpr int MaxChecksumRetries = 1;
+constexpr quint16 PairingProtocolVersion = 2;
+constexpr qsizetype AuthenticationKeySize = 32;
+constexpr qsizetype AuthenticationChallengeSize = 32;
+constexpr qsizetype AuthenticationProofSize = 32;
+
+QByteArray randomAuthenticationBytes(qsizetype size)
+{
+    QByteArray result(size, Qt::Uninitialized);
+    for (qsizetype index = 0; index < size; ++index)
+        result[index] = char(QRandomGenerator::system()->generate() & 0xff);
+    return result;
+}
+
+bool constantTimeEqual(const QByteArray &left, const QByteArray &right)
+{
+    if (left.size() != right.size()) return false;
+    uchar difference = 0;
+    for (qsizetype index = 0; index < left.size(); ++index)
+        difference |= uchar(left.at(index)) ^ uchar(right.at(index));
+    return difference == 0;
+}
 
 bool isValidPeerId(const QString &peerId)
 {
     return !peerId.isEmpty() && peerId.size() <= 128
         && !peerId.contains(QLatin1Char('/')) && !peerId.contains(QLatin1Char('\\'));
+}
+
+bool hasStorageCapacity(const QString &directory, qint64 totalBytes, qint64 existingBytes)
+{
+    if (totalBytes <= 0) return true;
+    const qint64 reusable = existingBytes >= 0 && existingBytes <= totalBytes ? existingBytes : 0;
+    const qint64 remaining = totalBytes - reusable;
+    if (remaining <= 0) return true;
+    const QStorageInfo storage(directory);
+    if (!storage.isValid() || !storage.isReady() || storage.bytesAvailable() < 0)
+        return true; // The provider cannot report capacity; let the write path decide.
+    const qint64 available = storage.bytesAvailable();
+    return available > StorageReserveBytes
+        && remaining <= available - StorageReserveBytes;
 }
 
 struct DigestResult {
@@ -85,6 +130,59 @@ bool copyToAndroidDirectory(const QString &treeUri, const QString &sourcePath, c
 #endif
 }
 
+QByteArray TransferManager::controlRequestProof(const QByteArray &key,
+                                                const QString &senderId,
+                                                const QString &recipientId,
+                                                bool reconnecting,
+                                                const QByteArray &challenge)
+{
+    QByteArray payload;
+    QDataStream stream(&payload, QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_6_5);
+    stream << QByteArrayLiteral("landrop-control-request-v2")
+           << senderId << recipientId << reconnecting << challenge;
+    return QMessageAuthenticationCode::hash(payload, key, QCryptographicHash::Sha256);
+}
+
+QByteArray TransferManager::controlAcceptProof(const QByteArray &key,
+                                               const QString &senderId,
+                                               const QString &recipientId,
+                                               const QByteArray &requestChallenge,
+                                               const QByteArray &responseChallenge)
+{
+    QByteArray payload;
+    QDataStream stream(&payload, QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_6_5);
+    stream << QByteArrayLiteral("landrop-control-accept-v2")
+           << senderId << recipientId << requestChallenge << responseChallenge;
+    return QMessageAuthenticationCode::hash(payload, key, QCryptographicHash::Sha256);
+}
+
+QByteArray TransferManager::fileOfferProof(const QByteArray &key,
+                                           const QString &senderId,
+                                           const QString &recipientId,
+                                           const QByteArray &challenge,
+                                           const QString &transferId,
+                                           const QString &fileName,
+                                           qint64 totalBytes,
+                                           const QByteArray &checksum)
+{
+    QByteArray payload;
+    QDataStream stream(&payload, QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_6_5);
+    stream << QByteArrayLiteral("landrop-file-offer-v2")
+           << senderId << recipientId << challenge << transferId
+           << fileName << totalBytes << checksum;
+    return QMessageAuthenticationCode::hash(payload, key, QCryptographicHash::Sha256);
+}
+
+QByteArray TransferManager::mediaAuthorizationKey(const QByteArray &key)
+{
+    return QMessageAuthenticationCode::hash(
+        QByteArrayLiteral("landrop-media-authorization-v2"), key,
+        QCryptographicHash::Sha256);
+}
+
 TransferManager::TransferManager(QObject *parent)
     : TransferManager(TransferManagerOptions{}, parent)
 {
@@ -132,22 +230,47 @@ TransferManager::TransferManager(const TransferManagerOptions &options, QObject 
     connect(m_server, &QTcpServer::newConnection, this, &TransferManager::onNewConnection);
     auto *keepAlive = new QTimer(this);
     keepAlive->setInterval(15000);
-    connect(keepAlive, &QTimer::timeout, this, [this] {
-        const qint64 now = QDateTime::currentMSecsSinceEpoch();
-        QList<QTcpSocket *> stale;
-        for (auto it = m_sessions.cbegin(); it != m_sessions.cend(); ++it) {
-            auto *socket = it.value().data();
-            auto *context = socket ? m_tasks.value(socket) : nullptr;
-            if (!socket || !context || socket->state() != QAbstractSocket::ConnectedState)
-                continue;
-            if (context->lastActivityMs > 0 && now - context->lastActivityMs > SessionTimeoutMs)
-                stale.append(socket);
-            else
-                sendPacket(socket, MsgPing);
-        }
-        for (auto *socket : std::as_const(stale)) cleanupSocket(socket);
-    });
+    connect(keepAlive, &QTimer::timeout, this, &TransferManager::sweepSockets);
     keepAlive->start();
+}
+
+void TransferManager::sweepSockets()
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    struct ExpiredSocket { QTcpSocket *socket; QString status; bool preservePartial; };
+    QList<ExpiredSocket> expired;
+    for (auto it = m_tasks.cbegin(); it != m_tasks.cend(); ++it) {
+        QTcpSocket *socket = it.key();
+        TransferContext *context = it.value();
+        if (!socket || !context || context->lastActivityMs <= 0) continue;
+        const qint64 idleMs = now - context->lastActivityMs;
+        if (context->isControl) {
+            const bool currentSession = context->paired
+                && m_sessions.value(context->peerId).data() == socket;
+            if (currentSession && socket->state() == QAbstractSocket::ConnectedState) {
+                if (idleMs > SessionTimeoutMs) expired.append({socket, {}, true});
+                else sendPacket(socket, MsgPing);
+            } else if (idleMs > PairingDecisionTimeoutMs) {
+                expired.append({socket, {}, true});
+            }
+            continue;
+        }
+        if (context->id.isEmpty()) {
+            if (idleMs > IncomingHandshakeTimeoutMs)
+                expired.append({socket, QStringLiteral("protocol-error"), false});
+            continue;
+        }
+        const qint64 timeout = context->completionSent || context->verificationInProgress
+            ? VerificationTimeoutMs : TransferIdleTimeoutMs;
+        if (idleMs > timeout)
+            expired.append({socket, QStringLiteral("paused"), true});
+    }
+    for (const ExpiredSocket &item : std::as_const(expired)) {
+        if (!m_tasks.contains(item.socket)) continue;
+        qWarning() << "Closing idle transfer socket" << item.socket
+                   << "status" << item.status;
+        cleanupSocket(item.socket, item.status, item.preservePartial);
+    }
 }
 
 QString TransferManager::stateName(ConnectionState state)
@@ -204,7 +327,12 @@ void TransferManager::setConnectionState(const QString &peerId, ConnectionState 
     peer.state = state;
     qInfo() << "Peer connection state" << peerId << stateName(state);
     emit pairingStateChanged(peerId, stateName(state));
-    emit peerAuthorizationChanged(peerId, peer.ip, state == ConnectionState::Online);
+    const bool allowed = state == ConnectionState::Online
+                         && peer.authKey.size() == AuthenticationKeySize;
+    const QString mediaToken = allowed
+        ? QString::fromLatin1(mediaAuthorizationKey(peer.authKey).toBase64())
+        : QString{};
+    emit peerAuthorizationChanged(peerId, peer.ip, mediaToken, allowed);
     if (peer.trusted) emit trustedPeersChanged();
     if (state == ConnectionState::Online) {
         for (auto it = m_pendingOutgoing.cbegin(); it != m_pendingOutgoing.cend(); ++it)
@@ -224,6 +352,13 @@ void TransferManager::loadTrustedPeers()
         peer.ip = settings.value(QStringLiteral("ip")).toString();
         peer.port = quint16(settings.value(QStringLiteral("port")).toUInt());
         peer.lastSeen = settings.value(QStringLiteral("lastSeen")).toLongLong();
+        peer.authKey = QByteArray::fromBase64(
+            settings.value(QStringLiteral("authKey")).toByteArray());
+        if (peer.authKey.size() != AuthenticationKeySize) {
+            qWarning() << "Ignoring legacy trusted peer without an authentication key" << peerId;
+            settings.endGroup();
+            continue;
+        }
         peer.trusted = true;
         peer.state = ConnectionState::Offline;
         m_connections.insert(peerId, peer);
@@ -234,13 +369,18 @@ void TransferManager::loadTrustedPeers()
 
 bool TransferManager::isTrusted(const QString &peerId) const
 {
-    return m_connections.contains(peerId) && m_connections.value(peerId).trusted;
+    return m_connections.contains(peerId) && m_connections.value(peerId).trusted
+        && m_connections.value(peerId).authKey.size() == AuthenticationKeySize;
 }
 
 void TransferManager::saveTrustedPeer(const QString &peerId, const QString &name,
                                       const QString &ip, quint16 port)
 {
     auto &peer = m_connections[peerId];
+    if (peer.authKey.size() != AuthenticationKeySize) {
+        qWarning() << "Refusing to persist trusted peer without an authentication key" << peerId;
+        return;
+    }
     peer.trusted = true;
     peer.name = name;
     peer.ip = ip;
@@ -253,6 +393,7 @@ void TransferManager::saveTrustedPeer(const QString &peerId, const QString &name
     settings.setValue(QStringLiteral("ip"), peer.ip);
     settings.setValue(QStringLiteral("port"), peer.port);
     settings.setValue(QStringLiteral("lastSeen"), peer.lastSeen);
+    settings.setValue(QStringLiteral("authKey"), peer.authKey.toBase64());
     settings.endGroup();
     settings.endGroup();
     settings.sync();
@@ -261,7 +402,11 @@ void TransferManager::saveTrustedPeer(const QString &peerId, const QString &name
 
 void TransferManager::removeTrustedPeer(const QString &peerId)
 {
-    if (m_connections.contains(peerId)) m_connections[peerId].trusted = false;
+    if (m_connections.contains(peerId)) {
+        m_connections[peerId].trusted = false;
+        m_connections[peerId].authKey.fill('\0');
+        m_connections[peerId].authKey.clear();
+    }
     QSettings settings(m_settingsOrganization, m_settingsApplication);
     settings.beginGroup(QStringLiteral("trustedPeers"));
     settings.remove(peerId);
@@ -328,6 +473,14 @@ void TransferManager::requestPairing(const QString &peerId, const QString &peerN
 void TransferManager::openControlConnection(const QString &peerId, const QString &peerName,
                                             const QString &ip, quint16 port, bool reconnecting)
 {
+    QByteArray authKey = reconnecting ? m_connections.value(peerId).authKey
+                                      : randomAuthenticationBytes(AuthenticationKeySize);
+    if (authKey.size() != AuthenticationKeySize) {
+        qWarning() << "Cannot authenticate control connection for" << peerId;
+        setConnectionState(peerId, ConnectionState::Unpaired);
+        emit transferError(tr("设备身份凭据无效，请解除配对后重新配对"));
+        return;
+    }
     auto *socket = new QTcpSocket(this);
     auto *context = new TransferContext;
     context->isControl = true;
@@ -336,6 +489,9 @@ void TransferManager::openControlConnection(const QString &peerId, const QString
     context->peerName = peerName;
     context->peerIp = ip;
     context->peerPort = port;
+    context->authKey = authKey;
+    context->authChallenge = randomAuthenticationBytes(AuthenticationChallengeSize);
+    context->reconnecting = reconnecting;
     context->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
     m_tasks[socket] = context;
     socket->setSocketOption(QAbstractSocket::KeepAliveOption, 1);
@@ -345,8 +501,13 @@ void TransferManager::openControlConnection(const QString &peerId, const QString
         QSettings settings(m_settingsOrganization, m_settingsApplication);
         const QString localName = settings.value(QStringLiteral("identity/deviceName"),
                                                   QHostInfo::localHostName()).toString();
-        sendPacket(socket, MsgPairRequest, [this, localName](QDataStream &out) {
-            out << m_localId << localName << serverPort();
+        const QByteArray proof = controlRequestProof(item->authKey, m_localId,
+                                                     item->peerId, item->reconnecting,
+                                                     item->authChallenge);
+        sendPacket(socket, MsgPairRequest, [this, item, localName, proof](QDataStream &out) {
+            out << PairingProtocolVersion << m_localId << localName << serverPort()
+                << item->reconnecting << item->authChallenge
+                << (item->reconnecting ? QByteArray{} : item->authKey) << proof;
         });
     });
     connect(socket, &QTcpSocket::readyRead, this, [this, socket] { onReadyRead(socket); });
@@ -360,6 +521,13 @@ void TransferManager::openControlConnection(const QString &peerId, const QString
     });
     setConnectionState(peerId, reconnecting ? ConnectionState::Reconnecting
                                              : ConnectionState::Pairing);
+    const QPointer<QTcpSocket> guardedSocket(socket);
+    QTimer::singleShot(ConnectionTimeoutMs, socket, [this, guardedSocket] {
+        if (!guardedSocket || !m_tasks.contains(guardedSocket)
+            || guardedSocket->state() != QAbstractSocket::ConnectingState) return;
+        qWarning() << "Control connection timed out" << guardedSocket->peerName();
+        cleanupSocket(guardedSocket);
+    });
     socket->connectToHost(ip, port);
 }
 
@@ -378,13 +546,23 @@ void TransferManager::acceptPairingSocket(QTcpSocket *socket)
     auto *item = m_tasks.value(socket);
     if (!item || !item->isControl || item->isSender || item->peerId.isEmpty() || item->paired)
         return;
+    if (item->authKey.size() != AuthenticationKeySize
+        || item->authChallenge.size() != AuthenticationChallengeSize) {
+        cleanupSocket(socket, QStringLiteral("protocol-error"), false);
+        return;
+    }
+    m_connections[item->peerId].authKey = item->authKey;
+    const QByteArray responseChallenge = randomAuthenticationBytes(AuthenticationChallengeSize);
+    const QByteArray proof = controlAcceptProof(item->authKey, m_localId, item->peerId,
+                                                item->authChallenge, responseChallenge);
     item->paired = true;
     const bool adopted = establishSession(socket, item);
     QSettings settings(m_settingsOrganization, m_settingsApplication);
     const QString localName = settings.value(QStringLiteral("identity/deviceName"),
                                               QHostInfo::localHostName()).toString();
-    sendPacket(socket, MsgPairAccept, [this, localName](QDataStream &out) {
-        out << m_localId << localName << serverPort();
+    sendPacket(socket, MsgPairAccept, [this, localName, responseChallenge, proof](QDataStream &out) {
+        out << PairingProtocolVersion << m_localId << localName << serverPort()
+            << responseChallenge << proof;
     });
     if (!adopted) {
         socket->flush();
@@ -429,6 +607,7 @@ void TransferManager::forgetPeer(const QString &peerId)
         m_pendingOutgoing.remove(transfer.id);
         m_activeTransferIds.remove(transfer.id);
         m_transferRetryAttempts.remove(transfer.id);
+        m_checksumRetryAttempts.remove(transfer.id);
         if (!transfer.isSender && !transfer.partialPath.isEmpty())
             QFile::remove(transfer.partialPath);
         emit taskUpdated(transfer.id, transfer.progress, QStringLiteral("cancelled"),
@@ -501,6 +680,8 @@ void TransferManager::sendPacket(QTcpSocket *socket, MessageType type,
     out.device()->seek(0);
     out << quint32(packet.size() - sizeof(quint32));
     socket->write(packet);
+    if (auto *context = m_tasks.value(socket); context && !context->isControl)
+        context->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
 }
 
 void TransferManager::sendFiles(const QList<QUrl> &urls, const QString &ip, quint16 port)
@@ -645,10 +826,13 @@ void TransferManager::openOutgoingSocket(PersistedTransfer transfer)
     context->peerName = peer.name;
     context->peerIp = peer.ip;
     context->peerPort = peer.port;
+    context->authKey = peer.authKey;
+    context->authChallenge = randomAuthenticationBytes(AuthenticationChallengeSize);
     context->sourcePath = transfer.sourcePath;
     context->fileName = transfer.fileName;
     context->totalBytes = transfer.totalBytes;
     context->checksum = transfer.checksum;
+    context->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
     context->file = new QFile(transfer.sourcePath, this);
     m_tasks[socket] = context;
     if (!context->file->open(QIODevice::ReadOnly)) {
@@ -659,13 +843,22 @@ void TransferManager::openOutgoingSocket(PersistedTransfer transfer)
     }
     emit taskUpdated(transfer.id, transfer.progress, QStringLiteral("connecting"), transfer.checksum.toHex());
     connect(socket, &QTcpSocket::connected, this, [this, socket, context] {
-        sendPacket(socket, MsgFileOffer, [context](QDataStream &out) {
-            out << context->id << context->fileName << context->totalBytes << context->checksum;
+        const QByteArray proof = fileOfferProof(
+            context->authKey, m_localId, context->peerId, context->authChallenge,
+            context->id, context->fileName, context->totalBytes, context->checksum);
+        sendPacket(socket, MsgFileOffer, [this, context, proof](QDataStream &out) {
+            out << PairingProtocolVersion << m_localId << context->id << context->fileName
+                << context->totalBytes << context->checksum
+                << context->authChallenge << proof;
         });
         emit taskUpdated(context->id, 0, QStringLiteral("negotiating"), context->checksum.toHex());
     });
     connect(socket, &QTcpSocket::readyRead, this, [this, socket] { onReadyRead(socket); });
-    connect(socket, &QTcpSocket::bytesWritten, this, [this, socket](qint64) { sendNextChunk(socket); });
+    connect(socket, &QTcpSocket::bytesWritten, this, [this, socket](qint64) {
+        if (auto *item = m_tasks.value(socket))
+            item->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+        sendNextChunk(socket);
+    });
     connect(socket, &QTcpSocket::disconnected, this, [this, socket] {
         if (auto *item = m_tasks.value(socket))
             cleanupSocket(socket, item->completionSent ? QString{} : QStringLiteral("paused"), true);
@@ -673,6 +866,13 @@ void TransferManager::openOutgoingSocket(PersistedTransfer transfer)
     connect(socket, &QTcpSocket::errorOccurred, this,
             [this, socket](QAbstractSocket::SocketError) {
         if (m_tasks.contains(socket)) cleanupSocket(socket, QStringLiteral("paused"), true);
+    });
+    const QPointer<QTcpSocket> guardedSocket(socket);
+    QTimer::singleShot(ConnectionTimeoutMs, socket, [this, guardedSocket] {
+        if (!guardedSocket || !m_tasks.contains(guardedSocket)
+            || guardedSocket->state() != QAbstractSocket::ConnectingState) return;
+        qWarning() << "File transfer connection timed out" << guardedSocket->peerName();
+        cleanupSocket(guardedSocket, QStringLiteral("paused"), true);
     });
     socket->connectToHost(peer.ip, peer.port);
 }
@@ -716,6 +916,7 @@ void TransferManager::onNewConnection()
         auto *socket = m_server->nextPendingConnection();
         auto *context = new TransferContext;
         context->peerIp = socket->peerAddress().toString().remove(QStringLiteral("::ffff:"));
+        context->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
         m_tasks[socket] = context;
         connect(socket, &QTcpSocket::readyRead, this, [this, socket] { onReadyRead(socket); });
         connect(socket, &QTcpSocket::disconnected, this, [this, socket] {
@@ -762,22 +963,48 @@ void TransferManager::onReadyRead(QTcpSocket *socket)
             return;
         }
         if (type == MsgPairRequest) {
+            quint16 protocolVersion = 0;
             QString peerId, peerName;
-            packet >> peerId >> peerName;
             quint16 peerPort = 0;
-            if (!packet.atEnd()) packet >> peerPort;
-            if (packet.status() != QDataStream::Ok || !isValidPeerId(peerId) || peerId == m_localId
-                || peerName.trimmed().isEmpty() || peerName.size() > 80) {
+            bool reconnecting = false;
+            QByteArray challenge, proposedKey, proof;
+            packet >> protocolVersion >> peerId >> peerName >> peerPort >> reconnecting
+                   >> challenge >> proposedKey >> proof;
+            if (packet.status() != QDataStream::Ok || context->isControl || context->file
+                || !context->id.isEmpty() || !isValidPeerId(peerId) || peerId == m_localId
+                || peerName.trimmed().isEmpty() || peerName.size() > 80
+                || protocolVersion != PairingProtocolVersion || !packet.atEnd()
+                || challenge.size() != AuthenticationChallengeSize
+                || proof.size() != AuthenticationProofSize) {
+                fail(); return;
+            }
+            const bool trusted = isTrusted(peerId);
+            if (reconnecting != trusted
+                || (!reconnecting && proposedKey.size() != AuthenticationKeySize)
+                || (reconnecting && !proposedKey.isEmpty())) {
+                qWarning() << "Rejected pairing mode mismatch for" << peerId
+                           << "reconnecting" << reconnecting << "trusted" << trusted;
+                fail(); return;
+            }
+            const QByteArray authKey = reconnecting
+                ? m_connections.value(peerId).authKey : proposedKey;
+            const QByteArray expectedProof = controlRequestProof(
+                authKey, peerId, m_localId, reconnecting, challenge);
+            if (!constantTimeEqual(proof, expectedProof)) {
+                qWarning() << "Rejected invalid control authentication proof for" << peerId;
                 fail(); return;
             }
             context->isControl = true;
             context->peerId = peerId;
             context->peerName = peerName.trimmed();
             context->peerPort = peerPort;
+            context->authKey = authKey;
+            context->authChallenge = challenge;
+            context->reconnecting = reconnecting;
             socket->setSocketOption(QAbstractSocket::KeepAliveOption, 1);
             qInfo() << "Incoming pairing request from" << context->peerName << context->peerIp
                     << "peerId" << peerId;
-            if (isTrusted(peerId)) {
+            if (reconnecting) {
                 auto &peer = m_connections[peerId];
                 peer.name = context->peerName;
                 peer.ip = context->peerIp;
@@ -790,23 +1017,36 @@ void TransferManager::onReadyRead(QTcpSocket *socket)
                 emit pairingRequested(peerId, context->peerName, context->peerIp);
             }
         } else if (type == MsgPairAccept) {
+            quint16 protocolVersion = 0;
             QString peerId, peerName;
-            packet >> peerId >> peerName;
             quint16 peerPort = 0;
-            if (!packet.atEnd()) packet >> peerPort;
+            QByteArray responseChallenge, proof;
+            packet >> protocolVersion >> peerId >> peerName >> peerPort
+                   >> responseChallenge >> proof;
             if (packet.status() != QDataStream::Ok || !context->isControl || !context->isSender
-                || peerId != context->peerId || peerName.size() > 80) {
+                || peerId != context->peerId || peerName.trimmed().isEmpty()
+                || peerName.size() > 80 || protocolVersion != PairingProtocolVersion
+                || responseChallenge.size() != AuthenticationChallengeSize
+                || proof.size() != AuthenticationProofSize || !packet.atEnd()) {
+                fail(); return;
+            }
+            const QByteArray expectedProof = controlAcceptProof(
+                context->authKey, peerId, m_localId,
+                context->authChallenge, responseChallenge);
+            if (!constantTimeEqual(proof, expectedProof)) {
+                qWarning() << "Rejected invalid pairing acceptance proof for" << peerId;
                 fail(); return;
             }
             context->peerName = peerName.trimmed();
             if (peerPort) context->peerPort = peerPort;
+            m_connections[peerId].authKey = context->authKey;
             context->paired = true;
             if (!establishSession(socket, context)) {
                 cleanupSocket(socket);
                 return;
             }
         } else if (type == MsgPairReject) {
-            if (!context->isControl) { fail(); return; }
+            if (!context->isControl || !context->isSender) { fail(); return; }
             removeTrustedPeer(context->peerId);
             setConnectionState(context->peerId, ConnectionState::Unpaired);
             cleanupSocket(socket);
@@ -820,26 +1060,44 @@ void TransferManager::onReadyRead(QTcpSocket *socket)
             QString text;
             packet >> text;
             if (packet.status() != QDataStream::Ok || text.size() > MaxTextLength
-                || (context->isControl && !context->paired)) {
+                || !context->isControl || !context->paired) {
                 fail(); return;
             }
             emit textReceived(context->peerIp, text);
-            if (!context->isControl) {
-                cleanupSocket(socket);
-                return;
-            }
         } else if (type == MsgFileOffer) {
-            if (!isPairedIp(context->peerIp)) { fail(); return; }
-            packet >> context->id >> context->fileName >> context->totalBytes >> context->checksum;
-            context->fileName = QFileInfo(context->fileName).fileName();
-            if (packet.status() != QDataStream::Ok || context->id.isEmpty() || context->fileName.isEmpty()
-                || context->fileName.size() > 255 || context->totalBytes < 0
-                || context->checksum.size() != 32) {
+            if (context->isControl || context->isSender || context->file
+                || !context->id.isEmpty()) {
                 fail(); return;
             }
-            context->peerId = peerIdForIp(context->peerIp);
-            if (context->peerId.isEmpty()) { fail(); return; }
-            const PeerConnection peer = m_connections.value(context->peerId);
+            quint16 protocolVersion = 0;
+            QString claimedPeerId;
+            QByteArray challenge, proof;
+            packet >> protocolVersion >> claimedPeerId >> context->id >> context->fileName
+                   >> context->totalBytes >> context->checksum >> challenge >> proof;
+            const auto controlSocket = m_sessions.value(claimedPeerId);
+            const auto *controlContext = controlSocket ? m_tasks.value(controlSocket) : nullptr;
+            const PeerConnection peer = m_connections.value(claimedPeerId);
+            const QByteArray expectedProof = fileOfferProof(
+                peer.authKey, claimedPeerId, m_localId, challenge, context->id,
+                context->fileName, context->totalBytes, context->checksum);
+            if (packet.status() != QDataStream::Ok || protocolVersion != PairingProtocolVersion
+                || !packet.atEnd() || !isValidPeerId(claimedPeerId) || !isPaired(claimedPeerId)
+                || !controlContext || controlContext->peerIp != context->peerIp
+                || peer.authKey.size() != AuthenticationKeySize
+                || challenge.size() != AuthenticationChallengeSize
+                || proof.size() != AuthenticationProofSize
+                || !constantTimeEqual(proof, expectedProof)
+                || context->id.isEmpty() || context->fileName.isEmpty()
+                || context->fileName.size() > 255 || context->totalBytes < 0
+                || context->checksum.size() != 32
+                || QFileInfo(context->fileName).fileName() != context->fileName) {
+                qWarning() << "Rejected unauthenticated or invalid file offer from"
+                           << context->peerIp << "claimed peer" << claimedPeerId;
+                fail(); return;
+            }
+            context->peerId = claimedPeerId;
+            context->authKey = peer.authKey;
+            context->authChallenge = challenge;
             context->peerName = peer.name;
             context->peerPort = peer.port;
             const auto saved = m_transferStore.find(context->id);
@@ -879,6 +1137,24 @@ void TransferManager::onReadyRead(QTcpSocket *socket)
                     QStringLiteral(".%1.%2.part").arg(context->fileName,
                                                        QString(context->checksum.toHex().left(12))));
                 context->finalPath = availableFinalPath(context->fileName);
+            }
+            const QString receivePath = storagePath();
+            QDir().mkpath(receivePath);
+            const qint64 existingBytes = QFileInfo(context->partialPath).size();
+            if (!hasStorageCapacity(receivePath, context->totalBytes, existingBytes)) {
+                qWarning() << "Rejecting transfer because storage is insufficient"
+                           << context->id << "bytes" << context->totalBytes;
+                emit taskAdded(context->id, context->peerIp, context->fileName, false,
+                               context->totalBytes);
+                emit taskUpdated(context->id, 0, QStringLiteral("no-space"),
+                                 context->checksum.toHex());
+                context->completionSent = true;
+                sendPacket(socket, MsgComplete, [context](QDataStream &out) {
+                    out << context->id << false << context->checksum;
+                });
+                socket->flush();
+                socket->disconnectFromHost();
+                return;
             }
             context->file = new QFile(context->partialPath, this);
             if (!context->file->open(QIODevice::ReadWrite | QIODevice::Append)) {
@@ -920,7 +1196,8 @@ void TransferManager::onReadyRead(QTcpSocket *socket)
             QString id;
             qint64 offset = -1;
             packet >> id >> offset;
-            if (packet.status() != QDataStream::Ok || !context->isSender || id != context->id
+            if (packet.status() != QDataStream::Ok || context->isControl || !context->isSender
+                || context->offerAccepted || id != context->id
                 || offset < 0 || offset > context->totalBytes || !context->file
                 || !context->file->seek(offset)) {
                 fail(); return;
@@ -962,15 +1239,40 @@ void TransferManager::onReadyRead(QTcpSocket *socket)
             if (context->isSender) {
                 const bool verified = TransferProtocol::isCompletionVerified(
                     ok, hash, context->checksum);
+                const bool checksumMismatch = !ok && hash != context->checksum;
+                const bool peerRejected = !ok && hash == context->checksum;
+                const auto persisted = checksumMismatch ? m_transferStore.find(context->id)
+                                                        : std::nullopt;
                 if (!verified) {
                     qWarning() << "Transfer completion rejected or checksum mismatch"
                                << context->id << "peerAccepted" << ok;
                 }
                 emit taskUpdated(context->id, verified ? 1 : 0,
-                                 verified ? QStringLiteral("verified")
-                                          : QStringLiteral("checksum-error"),
+                                  verified ? QStringLiteral("verified")
+                                           : peerRejected ? QStringLiteral("rejected")
+                                           : QStringLiteral("checksum-error"),
                                  context->checksum.toHex());
+                const QString completedId = context->id;
                 cleanupSocket(socket);
+                if (verified) {
+                    m_checksumRetryAttempts.remove(completedId);
+                } else if (checksumMismatch && persisted && persisted->isSender
+                           && m_checksumRetryAttempts.value(completedId) < MaxChecksumRetries) {
+                    m_checksumRetryAttempts[completedId] += 1;
+                    PersistedTransfer retry = *persisted;
+                    retry.progress = 0;
+                    retry.status = QStringLiteral("retrying");
+                    m_transferStore.upsert(retry);
+                    enqueueOutgoing(retry, true);
+                    emit taskUpdated(completedId, 0, retry.status, retry.checksum.toHex());
+                    QTimer::singleShot(m_reconnectBaseDelayMs, this, [this, completedId] {
+                        auto it = m_pendingOutgoing.find(completedId);
+                        if (it == m_pendingOutgoing.end() || !isPaired(it->transfer.peerId)) return;
+                        const PendingOutgoing pending = *it;
+                        m_pendingOutgoing.erase(it);
+                        beginOutgoingTransfer(pending.transfer, pending.validateSource);
+                    });
+                }
                 return;
             }
             finishReceive(socket);
@@ -990,6 +1292,8 @@ void TransferManager::finishReceive(QTcpSocket *socket)
         return;
     context->file->flush();
     context->file->close();
+    context->verificationInProgress = true;
+    context->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
     emit taskUpdated(context->id,
                      context->totalBytes ? qreal(QFileInfo(context->partialPath).size()) / context->totalBytes : 1,
                      QStringLiteral("verifying"), context->checksum.toHex());
@@ -1010,8 +1314,12 @@ void TransferManager::finishReceive(QTcpSocket *socket)
         auto *item = m_tasks.value(guarded);
         if (!item || item->id != id)
             return;
+        item->verificationInProgress = false;
+        item->lastActivityMs = QDateTime::currentMSecsSinceEpoch();
         bool ok = digest.error.isEmpty() && digest.size == expectedSize && digest.hash == expectedHash;
         QString status = ok ? QStringLiteral("verified") : QStringLiteral("checksum-error");
+        if (!ok && status == QStringLiteral("checksum-error"))
+            QFile::remove(partial);
         if (ok && !QFile::rename(partial, final)) {
             ok = false;
             status = QStringLiteral("write-error");
@@ -1207,6 +1515,8 @@ void TransferManager::cleanupSocket(QTcpSocket *socket, const QString &status, b
             else if (!wasPaired && m_connections.value(peerId).state == ConnectionState::Reconnecting)
                 scheduleReconnect(peerId);
         }
+        context->authKey.fill('\0');
+        context->authKey.clear();
         delete context;
     }
     socket->disconnect(this);
@@ -1224,6 +1534,7 @@ void TransferManager::cancelTransfer(const QString &id)
     }
     if (m_pendingOutgoing.remove(id) > 0) {
         m_transferRetryAttempts.remove(id);
+        m_checksumRetryAttempts.remove(id);
         emit taskUpdated(id, 0, QStringLiteral("cancelled"), {});
         return;
     }
@@ -1232,6 +1543,7 @@ void TransferManager::cancelTransfer(const QString &id)
         if (transfer->isSender) {
             m_cancelledTransferIds.insert(id);
             m_activeTransferIds.remove(id);
+            m_checksumRetryAttempts.remove(id);
         } else if (!transfer->partialPath.isEmpty()) {
             QFile::remove(transfer->partialPath);
         }
