@@ -4,8 +4,10 @@ import android.app.DownloadManager;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.database.Cursor;
 import android.net.Uri;
 import android.provider.DocumentsContract;
+import android.provider.OpenableColumns;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -16,6 +18,30 @@ import java.net.URLConnection;
 /** Android Storage Access Framework bridge used by the Qt transfer layer. */
 public final class StorageBridge {
     private StorageBridge() { }
+
+    /** Returns the user-visible name exposed by a Storage Access Framework provider. */
+    public static String displayName(Context context, String value) {
+        if (context == null || value == null || value.isEmpty()) return "";
+        try {
+            Uri uri = Uri.parse(value);
+            if (!"content".equals(uri.getScheme())) return "";
+            try (Cursor cursor = context.getContentResolver().query(
+                    uri, new String[] { OpenableColumns.DISPLAY_NAME },
+                    null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    int column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    if (column >= 0 && !cursor.isNull(column)) {
+                        String name = cursor.getString(column);
+                        return name == null ? "" : name.trim();
+                    }
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Providers may reject metadata queries. The native layer supplies
+            // a neutral generated name instead of exposing an opaque document ID.
+        }
+        return "";
+    }
 
     public static boolean persistDirectory(Context context, String value) {
         try {

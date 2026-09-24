@@ -116,6 +116,18 @@ bool persistAndroidDirectory(const QString &uri)
         "(Landroid/content/Context;Ljava/lang/String;)Z", context.object(), value.object());
 }
 
+QString androidDocumentDisplayName(const QString &uri)
+{
+    const QJniObject context = QNativeInterface::QAndroidApplication::context();
+    const QJniObject value = QJniObject::fromString(uri);
+    if (!context.isValid()) return {};
+    const QJniObject result = QJniObject::callStaticObjectMethod(
+        "org/landrop/app/StorageBridge", "displayName",
+        "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;",
+        context.object(), value.object());
+    return result.isValid() ? result.toString() : QString{};
+}
+
 bool copyToAndroidDirectory(const QString &treeUri, const QString &sourcePath, const QString &fileName)
 {
     const QJniObject context = QNativeInterface::QAndroidApplication::context();
@@ -702,7 +714,18 @@ void TransferManager::sendFiles(const QList<QUrl> &urls, const QString &ip, quin
     const PeerConnection peer = m_connections.value(peerId);
     for (const QUrl &url : urls) {
         const QString path = url.isLocalFile() ? url.toLocalFile() : url.toString();
-        QString name = url.fileName().isEmpty() ? QFileInfo(path).fileName() : url.fileName();
+        QString name;
+#ifdef Q_OS_ANDROID
+        if (url.scheme() == QStringLiteral("content"))
+            name = androidDocumentDisplayName(url.toString(QUrl::FullyEncoded));
+#endif
+        if (name.isEmpty() && url.isLocalFile())
+            name = QFileInfo(path).fileName();
+        if (name.isEmpty() && url.scheme() != QStringLiteral("content"))
+            name = url.fileName();
+        name = QFileInfo(name).fileName().trimmed();
+        if (name.size() > 255)
+            name = name.left(255);
         if (name.isEmpty())
             name = QStringLiteral("file-%1.bin").arg(QDateTime::currentMSecsSinceEpoch());
         const qint64 knownSize = url.isLocalFile() ? QFileInfo(path).size() : 0;
